@@ -553,9 +553,33 @@ func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 // Fetcher (outbound HTTP)
 // =====================================================================
 
+// fetchStream owns the live http.Response.Body for a streaming fetch.
+// Created by http_fetch_begin, consumed chunk-by-chunk via http_fetch_read,
+// released by http_fetch_close (or by EOF + final read).
+//
+// The host never buffers more than maxStreamChunk bytes at a time. The
+// goroutine doing reads is the cell's step goroutine: each http_fetch_read
+// call performs a single, bounded io.ReadFull-style read on resp.Body.
+type fetchStream struct {
+	resp    *http.Response
+	cancel  context.CancelFunc
+	// scratch is a per-stream reusable read buffer so we don't allocate
+	// a fresh slice on every chunk. Sized to the largest read requested.
+	scratch []byte
+}
+
+// maxStreamChunk is the hard ceiling per http_fetch_read call. Cells that
+// ask for more get clipped. Keeping this small bounds host memory growth
+// even if a malicious or buggy cell asks for 100MB at once.
+const maxStreamChunk uint32 = 4 * 1024 * 1024 // 4 MiB
+
 type fetcher struct {
 	client *http.Client
 	logger *slog.Logger
+
+	streamMu sync.Mutex
+	streams  map[uint64]*fetchStream
+	nextID   atomic.Uint64
 }
 
 func newFetcher(logger *slog.Logger) *fetcher {
@@ -578,8 +602,156 @@ func newFetcher(logger *slog.Logger) *fetcher {
 		ForceAttemptHTTP2:     true,
 	}
 	return &fetcher{
-		client: &http.Client{Transport: transport},
-		logger: logger,
+		client:  &http.Client{Transport: transport},
+		logger:  logger,
+		streams: map[uint64]*fetchStream{},
+	}
+}
+
+// begin starts a streaming fetch. The host issues the request, reads
+// status + headers, then returns immediately with a stream id. The
+// response body is held open until the cell drains it (via readChunk)
+// or releases it (via closeStream). The cell decides chunk size.
+//
+// Unlike do(), this does NOT enforce a per-request timeout up front:
+// large transfers can legitimately take many minutes. The cell can pass
+// req.Timeout for a request-wide cap; otherwise it gets cancellation
+// only on closeStream or host shutdown.
+func (f *fetcher) begin(ctx context.Context, req abi.HTTPFetchRequest) (id uint64, status uint32, headers map[string]string, err error) {
+	if strings.TrimSpace(req.URL) == "" {
+		return 0, 0, nil, errors.New("url is required")
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	// Detach from the caller ctx — the cell controls lifetime via
+	// http_fetch_close. We still honor cancellation via the stream's own
+	// cancel func, and respect req.Timeout if set.
+	streamCtx, cancel := context.WithCancel(context.Background())
+	if req.Timeout > 0 {
+		streamCtx, cancel = context.WithTimeout(streamCtx, time.Duration(req.Timeout))
+	}
+
+	var body io.Reader
+	if len(req.Body) > 0 {
+		body = bytes.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(streamCtx, method, req.URL, body)
+	if err != nil {
+		cancel()
+		return 0, 0, nil, fmt.Errorf("build request: %w", err)
+	}
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := f.client.Do(httpReq)
+	if err != nil {
+		cancel()
+		return 0, 0, nil, fmt.Errorf("do request: %w", err)
+	}
+
+	hdrs := map[string]string{}
+	for k, vs := range resp.Header {
+		if len(vs) > 0 {
+			hdrs[k] = vs[0]
+		}
+	}
+
+	id = f.nextID.Add(1)
+	f.streamMu.Lock()
+	f.streams[id] = &fetchStream{resp: resp, cancel: cancel}
+	f.streamMu.Unlock()
+	return id, uint32(resp.StatusCode), hdrs, nil
+}
+
+// readChunk reads up to maxBytes from the stream. Returns the chunk
+// bytes and an eof flag. On error returns it; the cell should still
+// call closeStream to release resources.
+//
+// The host buffer is bounded by min(maxBytes, maxStreamChunk). It is
+// reused across calls on the same stream (scratch is grown lazily up
+// to that ceiling).
+func (f *fetcher) readChunk(id uint64, maxBytes uint32) (chunk []byte, eof bool, err error) {
+	if maxBytes == 0 {
+		return nil, false, errors.New("max_bytes must be > 0")
+	}
+	if maxBytes > maxStreamChunk {
+		maxBytes = maxStreamChunk
+	}
+	f.streamMu.Lock()
+	s, ok := f.streams[id]
+	f.streamMu.Unlock()
+	if !ok {
+		return nil, false, fmt.Errorf("no such stream id %d", id)
+	}
+
+	if cap(s.scratch) < int(maxBytes) {
+		s.scratch = make([]byte, maxBytes)
+	} else {
+		s.scratch = s.scratch[:maxBytes]
+	}
+	n, readErr := s.resp.Body.Read(s.scratch)
+	if n > 0 {
+		// Copy out — the cell sees a fresh slice and we keep scratch
+		// for the next call.
+		out := make([]byte, n)
+		copy(out, s.scratch[:n])
+		if errors.Is(readErr, io.EOF) {
+			return out, true, nil
+		}
+		if readErr != nil {
+			return out, false, readErr
+		}
+		return out, false, nil
+	}
+	if errors.Is(readErr, io.EOF) {
+		return nil, true, nil
+	}
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	// n==0, no error — rare but valid for some readers. Treat as
+	// "try again" by returning an empty non-eof chunk; cell loops.
+	return nil, false, nil
+}
+
+// closeStream releases a stream. Idempotent — closing a non-existent
+// or already-closed stream returns nil. The cell MUST call this when
+// it finishes (or aborts) a streaming fetch; otherwise the TCP
+// connection stays out of the keep-alive pool.
+func (f *fetcher) closeStream(id uint64) error {
+	f.streamMu.Lock()
+	s, ok := f.streams[id]
+	if ok {
+		delete(f.streams, id)
+	}
+	f.streamMu.Unlock()
+	if !ok {
+		return nil
+	}
+	_ = s.resp.Body.Close()
+	s.cancel()
+	return nil
+}
+
+// closeAllStreams releases every live stream. Called by Teardown to
+// avoid leaking goroutines / sockets when the host shuts down with
+// cells mid-fetch.
+func (f *fetcher) closeAllStreams() {
+	f.streamMu.Lock()
+	victims := make([]*fetchStream, 0, len(f.streams))
+	for _, s := range f.streams {
+		victims = append(victims, s)
+	}
+	f.streams = map[uint64]*fetchStream{}
+	f.streamMu.Unlock()
+	for _, s := range victims {
+		_ = s.resp.Body.Close()
+		s.cancel()
 	}
 }
 
@@ -1181,6 +1353,9 @@ func httpInboundTeardown(ctx context.Context) error {
 	if sse != nil {
 		sse.stop()
 	}
+	if httpFetcher != nil {
+		httpFetcher.closeAllStreams()
+	}
 	var firstErr error
 	for _, s := range allServers() {
 		if err := s.stop(ctx); err != nil && firstErr == nil {
@@ -1432,6 +1607,146 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			return 0
 		}).
 		Export("http_fetch")
+
+	// http_fetch_begin(reqPtr, reqLen, hdrPtrOut, hdrLenOut) — opens a
+	// streaming fetch. Returns 0 on success and writes the msgpack-
+	// encoded HTTPFetchStreamHeader (id + status + headers) into cell
+	// memory via pulp_alloc. The cell then drains the body with
+	// http_fetch_read until eof, then calls http_fetch_close.
+	//
+	// Non-zero return codes:
+	//   1 reqLen == 0
+	//   2 read cell memory failed
+	//   3 decode HTTPFetchRequest failed
+	//   4 host-side request failed (network, build, etc.)
+	//   5 encode HTTPFetchStreamHeader failed
+	//   6 cell has no pulp_alloc export
+	//   7 pulp_alloc returned null / trapped
+	//   8 write cell memory failed
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, hdrPtrOut, hdrLenOut uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			req, err := abi.DecodeHTTPFetchRequest(data)
+			if err != nil {
+				return 3
+			}
+			id, status, headers, err := httpFetcher.begin(ctx, req)
+			if err != nil {
+				return 4
+			}
+			hdrBytes, err := abi.EncodeHTTPFetchStreamHeader(abi.HTTPFetchStreamHeader{
+				ID:      id,
+				Status:  status,
+				Headers: headers,
+			})
+			if err != nil {
+				_ = httpFetcher.closeStream(id)
+				return 5
+			}
+			allocFn := m.ExportedFunction("pulp_alloc")
+			if allocFn == nil {
+				_ = httpFetcher.closeStream(id)
+				return 6
+			}
+			results, err := allocFn.Call(ctx, uint64(len(hdrBytes)))
+			if err != nil || len(results) == 0 {
+				_ = httpFetcher.closeStream(id)
+				return 7
+			}
+			ptr := uint32(results[0])
+			if ptr == 0 {
+				_ = httpFetcher.closeStream(id)
+				return 7
+			}
+			if !m.Memory().Write(ptr, hdrBytes) {
+				_ = httpFetcher.closeStream(id)
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(hdrPtrOut, ptr) {
+				_ = httpFetcher.closeStream(id)
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(hdrLenOut, uint32(len(hdrBytes))) {
+				_ = httpFetcher.closeStream(id)
+				return 8
+			}
+			return 0
+		}).
+		Export("http_fetch_begin")
+
+	// http_fetch_read(streamID, maxBytes, chunkPtrOut, chunkLenOut) —
+	// pulls up to maxBytes from the stream (host clips to maxStreamChunk
+	// = 4MiB). Writes a msgpack-encoded HTTPFetchChunk into cell memory.
+	// Cell should keep calling until chunk.EOF is true.
+	//
+	// Non-zero return codes:
+	//   1 maxBytes == 0
+	//   4 host read error (not eof; stream is still valid for close)
+	//   5 encode HTTPFetchChunk failed
+	//   6 cell has no pulp_alloc export
+	//   7 pulp_alloc returned null
+	//   8 write cell memory failed
+	//
+	// Note: an unknown stream id is reported via chunk.Err (return 0),
+	// not a non-zero return — so the cell sees a single failure path.
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, streamIDLo, streamIDHi, maxBytes, chunkPtrOut, chunkLenOut uint32) uint32 {
+			id := (uint64(streamIDHi) << 32) | uint64(streamIDLo)
+			if maxBytes == 0 {
+				return 1
+			}
+			data, eof, err := httpFetcher.readChunk(id, maxBytes)
+			chunk := abi.HTTPFetchChunk{Bytes: data, EOF: eof}
+			if err != nil {
+				chunk.Err = err.Error()
+			}
+			payload, encErr := abi.EncodeHTTPFetchChunk(chunk)
+			if encErr != nil {
+				return 5
+			}
+			allocFn := m.ExportedFunction("pulp_alloc")
+			if allocFn == nil {
+				return 6
+			}
+			results, allocErr := allocFn.Call(ctx, uint64(len(payload)))
+			if allocErr != nil || len(results) == 0 {
+				return 7
+			}
+			ptr := uint32(results[0])
+			if ptr == 0 {
+				return 7
+			}
+			if !m.Memory().Write(ptr, payload) {
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(chunkPtrOut, ptr) {
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(chunkLenOut, uint32(len(payload))) {
+				return 8
+			}
+			return 0
+		}).
+		Export("http_fetch_read")
+
+	// http_fetch_close(streamID) — releases the stream. Idempotent.
+	// Must be called when the cell finishes or aborts a streaming
+	// fetch; otherwise the TCP connection cannot return to the
+	// keep-alive pool.
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, streamIDLo, streamIDHi uint32) uint32 {
+			id := (uint64(streamIDHi) << 32) | uint64(streamIDLo)
+			_ = httpFetcher.closeStream(id)
+			return 0
+		}).
+		Export("http_fetch_close")
+
 	return nil
 }
 
@@ -1439,6 +1754,15 @@ func httpOutboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
 		Export("http_fetch")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
+		Export("http_fetch_begin")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _, _, _, _ uint32) uint32 { return 99 }).
+		Export("http_fetch_read")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("http_fetch_close")
 	return nil
 }
 
