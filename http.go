@@ -573,6 +573,12 @@ type fetchStream struct {
 // even if a malicious or buggy cell asks for 100MB at once.
 const maxStreamChunk uint32 = 4 * 1024 * 1024 // 4 MiB
 
+// maxLegacyFetchBytes caps the unary `http_fetch` body. Callers needing more
+// must migrate to http_fetch_begin/read/close (streaming). 50 MiB matches
+// what STATE.md historically claimed the cap was — making it real, not
+// fictional. Larger fetches surface an explicit error rather than OOMing.
+const maxLegacyFetchBytes int64 = 50 * 1024 * 1024 // 50 MiB
+
 type fetcher struct {
 	client *http.Client
 	logger *slog.Logger
@@ -793,9 +799,24 @@ func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPRes
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Bounded one-shot read — legacy Fetch path buffers the entire body in
+	// host memory before returning to the cell. Without a cap a hostile or
+	// oversized peer (multi-GB world archive, ATM-class .mrpack) OOMs the
+	// Pulp host. Callers needing larger bodies should migrate to the
+	// streaming FetchStream API (http_fetch_begin/read/close).
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxLegacyFetchBytes))
 	if err != nil {
 		return abi.HTTPResponse{}, fmt.Errorf("read response body: %w", err)
+	}
+	if int64(len(respBody)) == maxLegacyFetchBytes {
+		// Either body == cap exactly OR body was truncated. Probe one more
+		// byte to disambiguate; on truncation, surface a clear error so the
+		// caller migrates to FetchStream instead of receiving a silently-
+		// short response.
+		var probe [1]byte
+		if n, _ := resp.Body.Read(probe[:]); n > 0 {
+			return abi.HTTPResponse{}, fmt.Errorf("response body exceeds %d bytes — use http_fetch_begin streaming API", maxLegacyFetchBytes)
+		}
 	}
 
 	headers := map[string]string{}
