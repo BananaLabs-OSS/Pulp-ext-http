@@ -6,11 +6,22 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"testing"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
 )
+
+// TestMain allowlists loopback so the streaming tests — which run against
+// httptest servers bound to 127.0.0.1 — are exempt from the SSRF egress
+// guard's default private/loopback block. This exercises the
+// HTTP_FETCH_ALLOW config path that the platform uses to permit a
+// genuinely-needed internal target.
+func TestMain(m *testing.M) {
+	os.Setenv("HTTP_FETCH_ALLOW", "127.0.0.0/8,::1/128")
+	os.Exit(m.Run())
+}
 
 // TestFetcherStreaming_100MB_BoundedHostMemory drives the fetcher's
 // streaming path against an httptest server that produces a 100MB body.
