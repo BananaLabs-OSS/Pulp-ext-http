@@ -607,6 +607,15 @@ const maxLegacyFetchBytes int64 = 50 * 1024 * 1024 // 50 MiB
 // A genuinely-needed internal host can be allowlisted via the
 // HTTP_FETCH_ALLOW env var (comma-separated host[:port] or CIDR entries);
 // default is deny-all-private.
+//
+// The name-allowlist exemption is decided PER DIAL against the host the
+// dialer is actually about to connect to, NOT pinned once onto the request
+// context. This matters for redirects: an allowlisted host that 302s to a
+// loopback / metadata / RFC-1918 target is still IP-blocked, because the
+// redirect hop dials a DIFFERENT host that is re-checked against the
+// allowlist on its own. Pinning the exemption to the request context (the
+// previous approach) leaked it onto every redirect hop and re-opened the
+// SSRF this guard exists to close.
 
 // errBlockedTarget is returned by the dialer Control hook when a resolved
 // IP falls in a blocked range. It surfaces to the cell as a do-request
@@ -696,12 +705,6 @@ func ipBlocked(ip net.IP) bool {
 	return false
 }
 
-// allowedHostKey is the context key set when a request targets a
-// name-allowlisted host. The dialer Control hook reads it to exempt that
-// connection from the IP block (a host allowlisted by name may legitimately
-// resolve to a private IP — e.g. an internal service reached by name).
-type allowedHostKey struct{}
-
 // dialControl is the net.Dialer.Control hook. It runs AFTER name
 // resolution, once per resolved address the dialer attempts, with the
 // concrete IP:port it is about to connect to. Returning an error aborts
@@ -709,8 +712,8 @@ type allowedHostKey struct{}
 // private) cannot slip past, because we check the address actually dialed.
 //
 // Control's signature has no context, so the name-allowlist exemption is
-// handled separately in dialContext (which does see ctx); this hook only
-// performs the unconditional IP block.
+// handled separately in dialContext (which sees the dialed host:port); this
+// hook only performs the unconditional IP block.
 func (g *egressGuard) dialControl(_ string, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -729,13 +732,24 @@ func (g *egressGuard) dialControl(_ string, address string, _ syscall.RawConn) e
 	return nil
 }
 
-// dialContext wraps net.Dialer.DialContext so a name-allowlisted request
-// (flagged via allowedHostKey on ctx) bypasses the IP block entirely,
-// while every other request goes through the Control hook IP check.
+// dialContext wraps net.Dialer.DialContext and decides the name-allowlist
+// exemption PER DIAL, keyed on the host:port the dialer is actually about
+// to connect to (`address`). http.Transport passes the CURRENT hop's
+// unresolved host:port here — so on a redirect, this runs again with the
+// REDIRECT TARGET's host, not the original request's. A host that is on
+// the name allowlist bypasses the IP block (it may legitimately resolve to
+// a private IP, e.g. an internal service reached by name); any other host
+// — including a redirect target that is NOT allowlisted — goes through the
+// Control-guarded base dialer and is IP-blocked if it lands on a
+// loopback / metadata / RFC-1918 address.
+//
+// This is what closes the redirect-bypass: the exemption is never pinned
+// to the request context, so it cannot ride a 302 from an allowlisted host
+// to an internal target. Each hop earns (or is denied) its own exemption.
 func (g *egressGuard) dialContext(base func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	exempt := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		if v, _ := ctx.Value(allowedHostKey{}).(bool); v {
+		if g.hostAllowed(address) {
 			return exempt.DialContext(ctx, network, address)
 		}
 		return base(ctx, network, address)
@@ -753,18 +767,14 @@ func (g *egressGuard) checkScheme(req *http.Request) error {
 	}
 }
 
-// prepare validates the request's scheme and, if its host is on the
-// explicit name allowlist, marks the request context so the dialer
-// exempts it from the IP block. Returns the (possibly context-augmented)
-// request. Must be called before client.Do on the initial request; the
-// scheme is re-checked on redirects by CheckRedirect.
+// prepare validates the request's scheme before client.Do. The
+// name-allowlist / IP-block decision is NOT made here — it is made per dial
+// in dialContext/dialControl against the host actually being connected to,
+// so it re-evaluates correctly on every redirect hop. Scheme is re-checked
+// on redirects by CheckRedirect.
 func (g *egressGuard) prepare(req *http.Request) (*http.Request, error) {
 	if err := g.checkScheme(req); err != nil {
 		return nil, err
-	}
-	if g.hostAllowed(req.URL.Host) {
-		ctx := context.WithValue(req.Context(), allowedHostKey{}, true)
-		req = req.WithContext(ctx)
 	}
 	return req, nil
 }

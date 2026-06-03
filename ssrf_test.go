@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -117,5 +118,78 @@ func TestSSRF_RedirectToLoopbackBlocked(t *testing.T) {
 	_, err := f.do(context.Background(), abi.HTTPFetchRequest{URL: redir.URL})
 	if err == nil || !strings.Contains(err.Error(), "scheme") {
 		t.Fatalf("expected redirect to file:// scheme to be blocked, got %v", err)
+	}
+}
+
+// hostOf returns the host:port of an httptest server URL.
+func hostOf(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rawURL, err)
+	}
+	return u.Host
+}
+
+// TestSSRF_NameAllowlistRedirectToPrivateBlocked is the regression test for
+// the adf3fdf redirect-bypass: a host allowlisted BY NAME that 302-redirects
+// to a non-allowlisted internal target must NOT leak it. Previously the
+// name-allowlist exemption was pinned to the request context and rode every
+// redirect hop, so the redirect target's IP block was bypassed. The fix
+// re-evaluates the name exemption per dial against the host actually being
+// dialed, so the redirect hop (a different, non-allowlisted host) is still
+// IP-blocked.
+func TestSSRF_NameAllowlistRedirectToPrivateBlocked(t *testing.T) {
+	// The "internal" target — a loopback server holding a secret. It is NOT
+	// on the allowlist.
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("IAM-CREDS"))
+	}))
+	defer internal.Close()
+
+	// The allowlisted-by-name redirector. It 302s to the internal target.
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL, http.StatusFound)
+	}))
+	defer redir.Close()
+
+	// Allowlist ONLY the redirector, by its host:port name — NOT a CIDR, and
+	// NOT the internal target. This is the README's "allowlist an internal
+	// host by name" config that armed the bypass.
+	f := newGuardedFetcher(hostOf(t, redir.URL))
+
+	resp, err := f.do(context.Background(), abi.HTTPFetchRequest{URL: redir.URL})
+	if err == nil {
+		t.Fatalf("BYPASS: redirect from name-allowlisted host to non-allowlisted internal target succeeded (status %d, body %q) — IP block was bypassed across the redirect hop", resp.Status, string(resp.Body))
+	}
+	if !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("expected redirect target to be IP-blocked, got a different error: %v", err)
+	}
+}
+
+// TestSSRF_NameAllowlistRedirectToAllowedOK confirms the fix does NOT
+// over-block: a host allowlisted by name that redirects to ANOTHER
+// also-allowlisted host still works. Both hops earn their own per-dial
+// exemption.
+func TestSSRF_NameAllowlistRedirectToAllowedOK(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer final.Close()
+
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL, http.StatusFound)
+	}))
+	defer redir.Close()
+
+	// Allowlist BOTH hosts by name.
+	f := newGuardedFetcher(hostOf(t, redir.URL) + "," + hostOf(t, final.URL))
+
+	resp, err := f.do(context.Background(), abi.HTTPFetchRequest{URL: redir.URL})
+	if err != nil {
+		t.Fatalf("redirect between two name-allowlisted hosts should succeed, got %v", err)
+	}
+	if resp.Status != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", resp.Status)
 	}
 }
