@@ -332,15 +332,24 @@ func (s *httpServer) start(_ context.Context) error {
 		Handler: mux,
 	}
 	useTLS := s.certPath != "" && s.keyPath != ""
+
+	// Probe the bind address before spawning the goroutine so that a
+	// port collision surfaces as a startup error instead of a silent log
+	// line that leaves the capability reporting healthy with no listener.
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("http bind %s: %w", s.addr, err)
+	}
+
 	go func() {
-		var err error
+		var serveErr error
 		if useTLS {
-			err = s.srv.ListenAndServeTLS(s.certPath, s.keyPath)
+			serveErr = s.srv.ServeTLS(ln, s.certPath, s.keyPath)
 		} else {
-			err = s.srv.ListenAndServe()
+			serveErr = s.srv.Serve(ln)
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("http listen failed", "err", err)
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			s.logger.Error("http listen failed", "err", serveErr)
 		}
 	}()
 	s.logger.Info("http server started", "addr", s.addr, "tls", useTLS)
@@ -417,20 +426,21 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	routes := s.routes
+	snapshot := make([]route, len(s.routes))
+	copy(snapshot, s.routes)
 	s.mu.Unlock()
 
 	var match *route
 	var params map[string]string
-	for i := range routes {
-		if routes[i].method != r.Method {
+	for i := range snapshot {
+		if snapshot[i].method != r.Method {
 			continue
 		}
-		p, ok := matchPattern(routes[i].parts, r.URL.Path)
+		p, ok := matchPattern(snapshot[i].parts, r.URL.Path)
 		if !ok {
 			continue
 		}
-		match = &routes[i]
+		match = &snapshot[i]
 		params = p
 		break
 	}
