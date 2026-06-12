@@ -1160,7 +1160,7 @@ func (w *wsServer) dropCell(cellID string) (routes, conns int) {
 func (w *wsServer) upgrade(rw http.ResponseWriter, r *http.Request) {
 	cellID, _ := w.ownerOfPath(r.URL.Path)
 	conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: false,
 	})
 	if err != nil {
 		w.logger.Error("ws accept failed", "err", err, "path", r.URL.Path)
