@@ -224,12 +224,29 @@ type route struct {
 type pathPart struct {
 	literal string
 	param   string
+	catch   bool // "*name" catch-all: captures the rest of the path
 }
 
 type inflightRequest struct {
 	cellID string
 	req      abi.HTTPRequest
 	respCh   chan abi.HTTPResponse
+	// spliceCh delivers a streaming-response directive instead of a buffered
+	// one (http_respond_stream): the dispatch goroutine then copies an upstream
+	// body straight to the client with per-write flush, exempt from the inbound
+	// timeout. Used for SSE / chunked / long-lived proxied responses.
+	spliceCh chan *spliceDirective
+}
+
+// spliceDirective tells the dispatch goroutine to stream a response body to the
+// client rather than write a buffered one. body is an upstream reader the host
+// copies with flush until EOF or client disconnect; onDone releases it.
+type spliceDirective struct {
+	status  int
+	headers map[string]string
+	cookies []string
+	body    io.ReadCloser
+	onDone  func()
 }
 
 type httpServer struct {
@@ -416,7 +433,14 @@ func (s *httpServer) finalize(id uint64) {
 }
 
 func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
-	if s.ws != nil && s.ws.hasRoute(r.URL.Path) {
+	// Only hand a request to the WS handler if it's an ACTUAL WebSocket upgrade.
+	// A path can carry both a WS route and HTTP routes (e.g. the machine relay
+	// /api/m/:id/*sub: WS for terminals, HTTP for the proxy); a plain GET/POST
+	// there must fall through to the HTTP routes, not be force-upgraded (426).
+	isWSUpgrade := r.Method == http.MethodGet &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") &&
+		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	if s.ws != nil && isWSUpgrade && s.ws.hasRoute(r.URL.Path) {
 		s.ws.upgrade(w, r)
 		return
 	}
@@ -487,7 +511,8 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 			Body:       body,
 			RemoteAddr: r.RemoteAddr,
 		},
-		respCh: make(chan abi.HTTPResponse, 1),
+		respCh:   make(chan abi.HTTPResponse, 1),
+		spliceCh: make(chan *spliceDirective, 1),
 	}
 
 	s.mu.Lock()
@@ -518,12 +543,85 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write(resp.Body)
+	case sd := <-ir.spliceCh:
+		// Streaming response: copy the upstream body straight to the client
+		// with per-write flush, NO inbound timeout (SSE / long-lived). This
+		// runs in the HTTP handler goroutine, NOT the cell step loop, so a
+		// long-lived stream never blocks the cell.
+		s.streamSplice(w, r, sd)
 	case <-time.After(defaultRequestTimeout):
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
 		http.Error(w, "cell timeout", http.StatusGatewayTimeout)
 	}
+}
+
+// streamSplice writes a streaming response: it sends the directive's status +
+// headers, then copies the upstream body to the client, flushing after each
+// chunk so SSE events arrive immediately. It stops on upstream EOF/error or
+// client disconnect (a goroutine closes the body when the request context is
+// done, unblocking the read). onDone releases the upstream stream.
+func (s *httpServer) streamSplice(w http.ResponseWriter, r *http.Request, sd *spliceDirective) {
+	defer sd.onDone()
+	for k, v := range sd.headers {
+		w.Header().Set(k, v)
+	}
+	for _, cookie := range sd.cookies {
+		w.Header().Add("Set-Cookie", cookie)
+	}
+	status := sd.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush() // commit headers immediately (EventSource opens on them)
+	}
+
+	// Client disconnect: closing the upstream body unblocks the pending Read.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-r.Context().Done():
+			_ = sd.body.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := sd.body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client gone
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// respondStream delivers a streaming directive to a pending inbound request.
+// Returns an error if the id is unknown (so the caller can try another server).
+func (s *httpServer) respondStream(id uint64, sd *spliceDirective) error {
+	s.mu.Lock()
+	ir, ok := s.pending[id]
+	if ok {
+		delete(s.pending, id)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no pending request id %d", id)
+	}
+	ir.spliceCh <- sd
+	return nil
 }
 
 // =====================================================================
@@ -534,9 +632,12 @@ func parsePattern(pattern string) []pathPart {
 	segments := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
 	parts := make([]pathPart, len(segments))
 	for i, seg := range segments {
-		if strings.HasPrefix(seg, ":") {
+		switch {
+		case strings.HasPrefix(seg, ":"):
 			parts[i] = pathPart{param: strings.TrimPrefix(seg, ":")}
-		} else {
+		case strings.HasPrefix(seg, "*"):
+			parts[i] = pathPart{param: strings.TrimPrefix(seg, "*"), catch: true}
+		default:
 			parts[i] = pathPart{literal: seg}
 		}
 	}
@@ -545,11 +646,15 @@ func parsePattern(pattern string) []pathPart {
 
 func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 	segments := strings.Split(strings.TrimPrefix(path, "/"), "/")
-	if len(segments) != len(parts) {
-		return nil, false
-	}
 	params := map[string]string{}
 	for i, p := range parts {
+		if p.catch { // "*name" — capture the remainder (may be empty); matches here on
+			params[p.param] = strings.Join(segments[i:], "/")
+			return params, true
+		}
+		if i >= len(segments) {
+			return nil, false
+		}
 		if p.param != "" {
 			params[p.param] = segments[i]
 			continue
@@ -557,6 +662,9 @@ func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 		if p.literal != segments[i] {
 			return nil, false
 		}
+	}
+	if len(segments) != len(parts) {
+		return nil, false
 	}
 	return params, true
 }
@@ -902,7 +1010,15 @@ func (f *fetcher) begin(ctx context.Context, req abi.HTTPFetchRequest) (id uint6
 
 	hdrs := map[string]string{}
 	for k, vs := range resp.Header {
-		if len(vs) > 0 {
+		if len(vs) == 0 {
+			continue
+		}
+		// Preserve ALL Set-Cookie values (a response can set several) by joining with
+		// "\n" — illegal inside a cookie value, so the cell can split them back out.
+		// Other multi-valued headers keep first-wins (the map ABI is single-valued).
+		if len(vs) > 1 && http.CanonicalHeaderKey(k) == "Set-Cookie" {
+			hdrs[k] = strings.Join(vs, "\n")
+		} else {
 			hdrs[k] = vs[0]
 		}
 	}
@@ -982,6 +1098,21 @@ func (f *fetcher) closeStream(id uint64) error {
 	_ = s.resp.Body.Close()
 	s.cancel()
 	return nil
+}
+
+// takeStream removes a stream from the table and hands its live response +
+// cancel to the caller, which becomes responsible for closing it. Used by the
+// inbound splice path (http_respond_stream): the host copies the body straight
+// to the client, so the cell must no longer read or close it. Returns ok=false
+// if the id is unknown (already drained/closed).
+func (f *fetcher) takeStream(id uint64) (*fetchStream, bool) {
+	f.streamMu.Lock()
+	defer f.streamMu.Unlock()
+	s, ok := f.streams[id]
+	if ok {
+		delete(f.streams, id)
+	}
+	return s, ok
 }
 
 // closeAllStreams releases every live stream. Called by Teardown to
@@ -1066,7 +1197,14 @@ func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPRes
 
 	headers := map[string]string{}
 	for k, vs := range resp.Header {
-		if len(vs) > 0 {
+		if len(vs) == 0 {
+			continue
+		}
+		// Preserve ALL Set-Cookie values (newline-joined; illegal in a cookie value)
+		// so a proxy can split them back out; other headers stay first-wins.
+		if len(vs) > 1 && http.CanonicalHeaderKey(k) == "Set-Cookie" {
+			headers[k] = strings.Join(vs, "\n")
+		} else {
 			headers[k] = vs[0]
 		}
 	}
@@ -1124,20 +1262,25 @@ func (w *wsServer) registerRoute(cellID, path string) error {
 }
 
 func (w *wsServer) hasRoute(path string) bool {
-	w.mu.Lock()
-	_, ok := w.routes[path]
-	w.mu.Unlock()
+	_, ok := w.ownerOfPath(path)
 	return ok
 }
 
-// ownerOfPath returns the cellID that registered path, if any.
-// Used so upgrade() can tag each new wsConn with its owning cell —
-// that tag powers per-cell teardown.
+// ownerOfPath returns the cellID that registered a route matching path, if any.
+// Keys are PATTERNS (supporting :param and *catchall, e.g. the remote-machine
+// relay /api/m/:id/*sub), so an exact hit is tried first, then pattern match.
 func (w *wsServer) ownerOfPath(path string) (string, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	cellID, ok := w.routes[path]
-	return cellID, ok
+	if cellID, ok := w.routes[path]; ok {
+		return cellID, true
+	}
+	for pat, cellID := range w.routes {
+		if _, ok := matchPattern(parsePattern(pat), path); ok {
+			return cellID, true
+		}
+	}
+	return "", false
 }
 
 // dropCell closes every connection owned by cellID and removes every
@@ -1803,6 +1946,47 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		}).
 		Export("http_respond")
 
+	// http_respond_stream(respPtr, respLen) — answer an inbound request by
+	// splicing an open outbound fetch stream to the client (SSE / chunked /
+	// long-lived). The host TAKES the stream from the fetch table and copies
+	// its body to the client with flush, exempt from the inbound timeout.
+	//   1 empty, 2 read fail, 3 decode fail, 4 unknown stream id,
+	//   5 no pending request (stream closed)
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, respPtr, respLen uint32) uint32 {
+			if respLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(respPtr, respLen)
+			if !ok {
+				return 2
+			}
+			meta, err := abi.DecodeHTTPRespondStream(data)
+			if err != nil {
+				return 3
+			}
+			fs, ok := httpFetcher.takeStream(meta.StreamID)
+			if !ok {
+				return 4
+			}
+			sd := &spliceDirective{
+				status:  int(meta.Status),
+				headers: meta.Headers,
+				cookies: meta.Cookies,
+				body:    fs.resp.Body,
+				onDone:  func() { _ = fs.resp.Body.Close(); fs.cancel() },
+			}
+			// Deliver to whichever server holds the pending request.
+			for _, srv := range allServers() {
+				if err := srv.respondStream(meta.ID, sd); err == nil {
+					return 0
+				}
+			}
+			sd.onDone() // no taker — release the stream we took
+			return 5
+		}).
+		Export("http_respond_stream")
+
 	return nil
 }
 
@@ -1816,6 +2000,9 @@ func httpInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 		Export("http_respond")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("http_respond_stream")
 	return nil
 }
 
