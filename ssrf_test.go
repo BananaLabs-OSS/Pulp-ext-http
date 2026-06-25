@@ -11,47 +11,24 @@ import (
 	"testing"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ssrfguard"
 )
 
 // newGuardedFetcher builds a fetcher with an explicit allowlist, bypassing
 // the env-derived one TestMain installs. Passing "" yields a default
-// deny-all-private guard so the block paths can be exercised.
+// deny-all-private guard (no seed hosts) so the block paths can be exercised.
 func newGuardedFetcher(allow string) *fetcher {
 	f := newFetcher(slog.Default())
-	guard := newEgressGuard(allow)
-	dialer := &net.Dialer{Control: guard.dialControl}
+	guard := ssrfguard.NewEgressGuard(allow, nil)
+	dialer := &net.Dialer{Control: guard.DialControl}
 	f.guard = guard
 	f.client.Transport = &http.Transport{
-		DialContext: guard.dialContext(dialer.DialContext),
+		DialContext: guard.DialContext(dialer.DialContext),
 	}
 	f.client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
-		return guard.checkScheme(req)
+		return guard.CheckScheme(req)
 	}
 	return f
-}
-
-func TestIPBlocked_Ranges(t *testing.T) {
-	blocked := []string{
-		"127.0.0.1",       // loopback
-		"::1",             // loopback v6
-		"169.254.169.254", // cloud metadata (link-local)
-		"10.1.2.3",        // RFC-1918
-		"172.16.0.1",      // RFC-1918
-		"192.168.1.1",     // RFC-1918
-		"fc00::1",         // ULA
-		"0.0.0.0",         // unspecified
-	}
-	for _, s := range blocked {
-		if !ipBlocked(net.ParseIP(s)) {
-			t.Errorf("ipBlocked(%s) = false, want true", s)
-		}
-	}
-	public := []string{"1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"}
-	for _, s := range public {
-		if ipBlocked(net.ParseIP(s)) {
-			t.Errorf("ipBlocked(%s) = true, want false (public)", s)
-		}
-	}
 }
 
 // TestSSRF_BlocksLoopback confirms a default (no-allowlist) fetcher refuses
