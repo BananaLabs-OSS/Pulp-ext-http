@@ -1,6 +1,6 @@
 # Pulp-ext-http
 
-net/http transport extension for Pulp. Registers four capabilities covering inbound HTTP, outbound fetch, WebSocket, and SSE. All four share a single HTTP server — stdlib-only alternative to `Pulp-ext-gin`.
+net/http transport extension for Pulp. Registers four capabilities covering inbound HTTP, outbound fetch, WebSocket, and SSE. By default all four share a single HTTP server bound to `HTTP_PORT`; cells that call `http_listen(addr)` can bind additional listeners or share a port with another cell — stdlib-only alternative to `Pulp-ext-gin`.
 
 From [BananaLabs OSS](https://github.com/BananaLabs-OSS).
 
