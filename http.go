@@ -1,10 +1,10 @@
 // Package httpext is Pulp's HTTP transport extension. It registers four
 // capabilities covering inbound HTTP, outbound fetch, WebSocket, and SSE.
 //
-// All four capabilities share a single HTTP server instance. The server
-// is started by transport.http.inbound's Setup and stopped by its
-// Teardown. WebSocket and SSE routes are served through the same
-// listener — the dispatch handler delegates based on path registration.
+// By default all four capabilities share the single HTTP server bound to
+// HTTP_PORT. Cells may also call http_listen to bind additional listeners;
+// WebSocket and SSE are attached to every listener. The default server is
+// started by transport.http.inbound's Setup and stopped by its Teardown.
 //
 // Environment variables:
 //
