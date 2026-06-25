@@ -46,6 +46,12 @@ const (
 	defaultRequestTimeout = 30 * time.Second
 	defaultFetchTimeout   = 30 * time.Second
 	sseKeepalive          = 15 * time.Second
+
+	// maxInboundBodyBytes caps inbound request bodies buffered in dispatch().
+	// Matches the legacy-fetch outbound cap so the host OOM profile is
+	// symmetric. Cells needing larger inbound payloads should use streaming
+	// multipart or chunked paths and avoid holding the whole body in memory.
+	maxInboundBodyBytes int64 = 50 * 1024 * 1024 // 50 MiB
 )
 
 // ---------------------------------------------------------------------
@@ -479,9 +485,17 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	// Cap inbound body to prevent a hostile client from OOMing the host.
+	// Mirrors the outbound maxLegacyFetchBytes limit. A truncated body is
+	// rejected with 413 — the cell never sees a silently-short payload.
+	limitedBody := io.LimitReader(r.Body, maxInboundBodyBytes+1)
+	body, err := io.ReadAll(limitedBody)
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if int64(len(body)) > maxInboundBodyBytes {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 
