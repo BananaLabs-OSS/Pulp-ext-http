@@ -1881,6 +1881,9 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 				return 3
 			}
 
+			if httpFetcher == nil {
+				return 99
+			}
 			resp, err := httpFetcher.do(ctx, req)
 			if err != nil {
 				return 4
@@ -1944,6 +1947,9 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			req, err := abi.DecodeHTTPFetchRequest(data)
 			if err != nil {
 				return 3
+			}
+			if httpFetcher == nil {
+				return 99
 			}
 			id, status, headers, err := httpFetcher.begin(ctx, req)
 			if err != nil {
@@ -2010,6 +2016,9 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			if maxBytes == 0 {
 				return 1
 			}
+			if httpFetcher == nil {
+				return 99
+			}
 			data, eof, err := httpFetcher.readChunk(id, maxBytes)
 			chunk := abi.HTTPFetchChunk{Bytes: data, EOF: eof}
 			if err != nil {
@@ -2051,6 +2060,9 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, streamIDLo, streamIDHi uint32) uint32 {
 			id := (uint64(streamIDHi) << 32) | uint64(streamIDLo)
+			if httpFetcher == nil {
+				return 99
+			}
 			_ = httpFetcher.closeStream(id)
 			return 0
 		}).
@@ -2090,6 +2102,9 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
+			if ws == nil {
+				return 99
+			}
 			if err := ws.registerRoute(cellID, string(data)); err != nil {
 				return 4
 			}
@@ -2110,6 +2125,9 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
+			if ws == nil {
+				return 99
+			}
 			if err := ws.send(ctx, req); err != nil {
 				return 4
 			}
@@ -2129,6 +2147,9 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			req, err := abi.DecodeWSCloseRequest(data)
 			if err != nil {
 				return 3
+			}
+			if ws == nil {
+				return 99
 			}
 			if err := ws.close(req); err != nil {
 				return 4
@@ -2168,6 +2189,9 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
+			if sse == nil {
+				return 99
+			}
 			if err := sse.registerRoute(cellID, string(data)); err != nil {
 				return 4
 			}
@@ -2188,6 +2212,9 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
+			if sse == nil {
+				return 99
+			}
 			if err := sse.emit(req); err != nil {
 				return 4
 			}
@@ -2207,6 +2234,9 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			data, ok := m.Memory().Read(pathPtr, pathLen)
 			if !ok {
 				return 2
+			}
+			if sse == nil {
+				return 99
 			}
 			count := sse.hasSubscribers(string(data))
 			if !m.Memory().WriteUint32Le(outCountPtr, count) {
