@@ -19,6 +19,15 @@ type recordingEndpointReporter struct {
 	gone  []ext.Endpoint
 }
 
+// optionalEndpointRegistry mirrors a host's optional concrete registry. A
+// nil *optionalEndpointRegistry assigned to ext.EndpointReporter is a non-nil
+// interface and is the shape direct Pulp applications pass when endpoint
+// discovery is not configured.
+type optionalEndpointRegistry struct{}
+
+func (*optionalEndpointRegistry) Ready(ext.Endpoint) error { return nil }
+func (*optionalEndpointRegistry) Gone(ext.Endpoint)        {}
+
 func (r *recordingEndpointReporter) Ready(endpoint ext.Endpoint) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -202,6 +211,41 @@ func TestLegacySetupStillUsesHTTPPortDefaultListener(t *testing.T) {
 		t.Fatalf("legacy HTTP_PORT listener: %v", err)
 	}
 	_ = connection.Close()
+}
+
+func TestScopedRegistrationFallsBackToDefaultListenerForTypedNilEndpointRegistry(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		_ = listener.Close()
+		t.Fatal(err)
+	}
+	_ = listener.Close()
+	t.Setenv("HTTP_PORT", port)
+
+	// Direct Pulp applications use an optional concrete endpoint registry.
+	// Passing its nil default through ext.EndpointReporter produces a typed-nil
+	// interface; it must retain the legacy listener rather than enter scoped
+	// endpoint publication mode.
+	var registry *optionalEndpointRegistry
+	var endpoints ext.EndpointReporter = registry
+	if err := httpInboundSetup(ext.SetupEnv{Endpoints: endpoints, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
+		t.Fatalf("setup with typed-nil endpoint registry: %v", err)
+	}
+	t.Cleanup(func() { _ = httpInboundTeardown(context.Background()) })
+
+	scope := endpointTestScope(t, "bananagine-composition-test", "default", "bananagine-composition-probe")
+	cellID := scope.RoutingID()
+	resolved := resolveServerForCell(cellID, scope)
+	if resolved == nil || resolved != server {
+		t.Fatalf("scoped registration resolved server = %p, want default %p", resolved, server)
+	}
+	if err := resolved.registerRoute(cellID, "GET", "/composition/health"); err != nil {
+		t.Fatalf("Bananagine-like scoped registration: %v", err)
+	}
 }
 
 func endpointTestScope(t *testing.T, application, instance, cell string) ext.Scope {

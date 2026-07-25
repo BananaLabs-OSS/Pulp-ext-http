@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,7 +129,25 @@ func applicationKey(scope ext.Scope) applicationInstanceKey {
 func scopedEndpointMode() bool {
 	scopedHTTPMu.Lock()
 	defer scopedHTTPMu.Unlock()
-	return endpointReporter != nil
+	return endpointReporterAvailable(endpointReporter)
+}
+
+// endpointReporterAvailable treats a typed-nil reporter as disabled. Hosts
+// commonly keep their optional endpoint registry as a concrete pointer; when
+// that pointer is nil, assigning it to ext.EndpointReporter produces a
+// non-nil interface that cannot accept Ready calls. The legacy listener is the
+// correct fallback in that case.
+func endpointReporterAvailable(reporter ext.EndpointReporter) bool {
+	if reporter == nil {
+		return false
+	}
+	value := reflect.ValueOf(reporter)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return !value.IsNil()
+	default:
+		return true
+	}
 }
 
 // resolveServerForCell returns the httpServer a cell's routes
@@ -166,7 +185,7 @@ func resolveScopedServer(scope ext.Scope, cellID, requestedAddr string) *httpSer
 	key := applicationKey(scope)
 	scopedHTTPMu.Lock()
 	defer scopedHTTPMu.Unlock()
-	if endpointReporter == nil {
+	if !endpointReporterAvailable(endpointReporter) {
 		return nil
 	}
 	if existing := scopedServers[key]; existing != nil {
@@ -1892,7 +1911,7 @@ func httpInboundSetup(env ext.SetupEnv) error {
 	// A host endpoint reporter selects multi-application mode. Listeners are
 	// allocated lazily per scoped app at first route registration so a guest's
 	// explicit http_listen call can still choose its private address.
-	if env.Endpoints != nil {
+	if endpointReporterAvailable(env.Endpoints) {
 		scopedHTTPMu.Lock()
 		endpointReporter = env.Endpoints
 		endpointLogger = logger
