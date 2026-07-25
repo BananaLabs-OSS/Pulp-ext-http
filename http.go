@@ -59,6 +59,8 @@ const (
 // ---------------------------------------------------------------------
 
 var (
+	lifecycleMu sync.Mutex
+
 	// server is the default HTTP listener bound during Setup from the
 	// HTTP_PORT env var. Cells that do not call http_listen register
 	// their routes here — backwards compatible with pre-multi-server
@@ -73,16 +75,61 @@ var (
 	altServersMu sync.RWMutex
 	altServers   = map[string]*httpServer{}
 
-	// cellAddr maps cellID → the addr it chose via http_listen.
-	// Cells that did not call http_listen are not in the map; their
-	// http_register calls route to the default server.
+	// cellAddr maps a host-issued cell scope → the addr it chose via
+	// http_listen. A scope is unique to an application instance; a bare cell
+	// name is used only by legacy single-application hosts. This is deliberately
+	// not a package-global "current app": one ext-http binary may serve many
+	// independently composed Pulp applications at the same time.
+	//
+	// Cells that did not call http_listen are not in the map; their http_register
+	// calls route to the default server for backwards compatibility.
 	cellAddrMu sync.RWMutex
 	cellAddr   = map[string]string{}
+	// routeBound records that a scope has registered at least one inbound
+	// route. http_listen is then deliberately immutable: changing listener
+	// after registration would split one application cell's public surface
+	// across hosts with no manifest-visible binding.
+	routeBound = map[string]bool{}
 
-	httpFetcher *fetcher
-	ws          *wsServer
-	sse         *sseServer
+	// scopedServers is the multi-application host-mode boundary. Setup installs
+	// one host-wide endpoint reporter; the first route for each application
+	// instance creates its private loopback listener and publishes its actual
+	// bound address with the registering cell's explicit scope.
+	scopedHTTPMu     sync.Mutex
+	scopedServers    = map[applicationInstanceKey]*scopedHTTPServer{}
+	cellApplications = map[string]applicationInstanceKey{}
+	endpointReporter ext.EndpointReporter
+	endpointLogger   *slog.Logger
+
+	// httpFetcher remains the legacy/default fetcher used by direct package
+	// callers. WASM cells always use the isolated fetcher stored in cellFetchers.
+	httpFetcher  *fetcher
+	fetchersMu   sync.Mutex
+	cellFetchers = map[string]*fetcher{}
+	ws           *wsServer
+	sse          *sseServer
 )
+
+type applicationInstanceKey struct {
+	applicationID string
+	instanceID    string
+}
+
+type scopedHTTPServer struct {
+	server   *httpServer
+	endpoint ext.Endpoint
+	reporter ext.EndpointReporter
+}
+
+func applicationKey(scope ext.Scope) applicationInstanceKey {
+	return applicationInstanceKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
+}
+
+func scopedEndpointMode() bool {
+	scopedHTTPMu.Lock()
+	defer scopedHTTPMu.Unlock()
+	return endpointReporter != nil
+}
 
 // resolveServerForCell returns the httpServer a cell's routes
 // should register against. Lookup order:
@@ -91,17 +138,72 @@ var (
 //
 // A cell that declares transport.http.inbound but neither calls
 // http_listen nor has HTTP_PORT set gets the default addr ":8080".
-func resolveServerForCell(cellID string) *httpServer {
+func resolveServerForCell(cellScope string, scope ext.Scope) *httpServer {
+	if !scope.IsLegacy() {
+		if scoped := resolveScopedServer(scope, cellScope, ""); scoped != nil {
+			return scoped
+		}
+	}
 	cellAddrMu.RLock()
-	addr, ok := cellAddr[cellID]
+	addr, ok := cellAddr[cellScope]
 	cellAddrMu.RUnlock()
 	if !ok {
+		return server
+	}
+	if addr == "" {
 		return server
 	}
 	altServersMu.RLock()
 	s := altServers[addr]
 	altServersMu.RUnlock()
 	return s
+}
+
+// resolveScopedServer creates one private public listener per application
+// instance. requestedAddr is honored for an explicit http_listen call; the
+// empty value auto-binds loopback port zero for host-mode composition.
+func resolveScopedServer(scope ext.Scope, cellID, requestedAddr string) *httpServer {
+	key := applicationKey(scope)
+	scopedHTTPMu.Lock()
+	defer scopedHTTPMu.Unlock()
+	if endpointReporter == nil {
+		return nil
+	}
+	if existing := scopedServers[key]; existing != nil {
+		if requestedAddr != "" && existing.server.addr != requestedAddr && existing.server.boundAddr != requestedAddr {
+			return nil
+		}
+		cellApplications[cellID] = key
+		return existing.server
+	}
+	if requestedAddr == "" {
+		requestedAddr = "127.0.0.1:0"
+	}
+	logger := endpointLogger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	created := newHTTPServer(requestedAddr, logger)
+	created.attachWebSocket(ws)
+	created.attachSSE(sse)
+	if err := created.start(context.Background()); err != nil {
+		logger.Error("scoped http listener failed", "cell", cellID, "addr", requestedAddr, "err", err)
+		return nil
+	}
+	endpoint := ext.Endpoint{
+		Scope:      scope,
+		Capability: "transport.http.inbound",
+		Name:       "public",
+		Address:    created.boundAddr,
+	}
+	if err := endpointReporter.Ready(endpoint); err != nil {
+		_ = created.stop(context.Background())
+		logger.Error("publish scoped http endpoint", "cell", cellID, "addr", created.boundAddr, "err", err)
+		return nil
+	}
+	scopedServers[key] = &scopedHTTPServer{server: created, endpoint: endpoint, reporter: endpointReporter}
+	cellApplications[cellID] = key
+	return created
 }
 
 // ensureAltServer returns the alt server at addr, creating and
@@ -133,7 +235,6 @@ func ensureAltServer(addr string, logger *slog.Logger) (*httpServer, error) {
 // when draining events or shutting down.
 func allServers() []*httpServer {
 	altServersMu.RLock()
-	defer altServersMu.RUnlock()
 	out := make([]*httpServer, 0, 1+len(altServers))
 	if server != nil {
 		out = append(out, server)
@@ -141,6 +242,12 @@ func allServers() []*httpServer {
 	for _, s := range altServers {
 		out = append(out, s)
 	}
+	altServersMu.RUnlock()
+	scopedHTTPMu.Lock()
+	for _, scoped := range scopedServers {
+		out = append(out, scoped.server)
+	}
+	scopedHTTPMu.Unlock()
 	return out
 }
 
@@ -150,14 +257,15 @@ func allServers() []*httpServer {
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "transport.http.inbound",
-		Register: httpInboundRegister,
-		Stub:     httpInboundStub,
-		Setup:    httpInboundSetup,
-		Teardown: httpInboundTeardown,
-		Poll:           httpInboundPoll,
-		TeardownCell: httpInboundTeardownCell,
-		Finalize: httpInboundFinalize,
+		Name:          "transport.http.inbound",
+		Register:      httpInboundRegister,
+		Stub:          httpInboundStub,
+		Setup:         httpInboundSetup,
+		Teardown:      httpInboundTeardown,
+		TeardownScope: httpInboundTeardownScope,
+		Poll:          httpInboundPoll,
+		TeardownCell:  httpInboundTeardownCell,
+		Finalize:      httpInboundFinalize,
 	})
 
 	ext.Register(ext.Capability{
@@ -222,9 +330,9 @@ func sseTeardownCell(_ context.Context, cellID string) error {
 // =====================================================================
 
 type route struct {
-	cellID string
-	method   string
-	parts    []pathPart
+	cellID string // host-issued scoped cell identity, not a package name
+	method string
+	parts  []pathPart
 }
 
 type pathPart struct {
@@ -235,8 +343,8 @@ type pathPart struct {
 
 type inflightRequest struct {
 	cellID string
-	req      abi.HTTPRequest
-	respCh   chan abi.HTTPResponse
+	req    abi.HTTPRequest
+	respCh chan abi.HTTPResponse
 	// spliceCh delivers a streaming-response directive instead of a buffered
 	// one (http_respond_stream): the dispatch goroutine then copies an upstream
 	// body straight to the client with per-write flush, exempt from the inbound
@@ -256,18 +364,19 @@ type spliceDirective struct {
 }
 
 type httpServer struct {
-	addr   string
-	logger *slog.Logger
+	addr      string
+	boundAddr string
+	logger    *slog.Logger
 
 	mu      sync.Mutex
 	routes  []route
 	pending map[uint64]*inflightRequest
 	nextID  atomic.Uint64
 
-	queue  chan *inflightRequest
-	srv    *http.Server
-	ws     *wsServer
-	sse    *sseServer
+	queue chan *inflightRequest
+	srv   *http.Server
+	ws    *wsServer
+	sse   *sseServer
 
 	certPath string
 	keyPath  string
@@ -284,6 +393,12 @@ func newHTTPServer(addr string, logger *slog.Logger) *httpServer {
 
 func (s *httpServer) attachWebSocket(w *wsServer) { s.ws = w }
 func (s *httpServer) attachSSE(e *sseServer)      { s.sse = e }
+func (s *httpServer) listenerKey() string {
+	if s.boundAddr != "" {
+		return s.boundAddr
+	}
+	return s.addr
+}
 
 func (s *httpServer) enableTLS(certPath, keyPath string) error {
 	if strings.TrimSpace(certPath) == "" || strings.TrimSpace(keyPath) == "" {
@@ -309,8 +424,18 @@ func (s *httpServer) registerRoute(cellID, method, pattern string) error {
 	parts := parsePattern(pattern)
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.routes {
+		if existing.method != method || !patternsOverlap(existing.parts, parts) {
+			continue
+		}
+		if existing.cellID == cellID && samePattern(existing.parts, parts) {
+			// Re-registering an identical route by its owner is idempotent.
+			return nil
+		}
+		return fmt.Errorf("ambiguous %s route %q conflicts with route owned by %q", method, pattern, existing.cellID)
+	}
 	s.routes = append(s.routes, route{cellID: cellID, method: method, parts: parts})
-	s.mu.Unlock()
 	s.logger.Info("http route registered", "cell", cellID, "method", method, "pattern", pattern)
 	return nil
 }
@@ -363,6 +488,7 @@ func (s *httpServer) start(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("http bind %s: %w", s.addr, err)
 	}
+	s.boundAddr = ln.Addr().String()
 
 	go func() {
 		var serveErr error
@@ -407,14 +533,14 @@ func (s *httpServer) popInflight() (*inflightRequest, bool) {
 	}
 }
 
-func (s *httpServer) respond(resp abi.HTTPResponse) error {
+func (s *httpServer) respond(cellID string, resp abi.HTTPResponse) error {
 	s.mu.Lock()
 	ir, ok := s.pending[resp.ID]
-	if ok {
+	if ok && ir.cellID == cellID {
 		delete(s.pending, resp.ID)
 	}
 	s.mu.Unlock()
-	if !ok {
+	if !ok || ir.cellID != cellID {
 		return fmt.Errorf("no pending request id %d", resp.ID)
 	}
 	ir.respCh <- resp
@@ -446,12 +572,12 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 	isWSUpgrade := r.Method == http.MethodGet &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") &&
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
-	if s.ws != nil && isWSUpgrade && s.ws.hasRoute(r.URL.Path) {
-		s.ws.upgrade(w, r)
+	if s.ws != nil && isWSUpgrade && s.ws.hasRoute(s.listenerKey(), r.URL.Path) {
+		s.ws.upgrade(s.listenerKey(), w, r)
 		return
 	}
-	if s.sse != nil && r.Method == http.MethodGet && s.sse.hasRoute(r.URL.Path) {
-		s.sse.handle(w, r)
+	if s.sse != nil && r.Method == http.MethodGet && s.sse.hasRoute(s.listenerKey(), r.URL.Path) {
+		s.sse.handle(s.listenerKey(), w, r)
 		return
 	}
 
@@ -624,14 +750,14 @@ func (s *httpServer) streamSplice(w http.ResponseWriter, r *http.Request, sd *sp
 
 // respondStream delivers a streaming directive to a pending inbound request.
 // Returns an error if the id is unknown (so the caller can try another server).
-func (s *httpServer) respondStream(id uint64, sd *spliceDirective) error {
+func (s *httpServer) respondStream(cellID string, id uint64, sd *spliceDirective) error {
 	s.mu.Lock()
 	ir, ok := s.pending[id]
-	if ok {
+	if ok && ir.cellID == cellID {
 		delete(s.pending, id)
 	}
 	s.mu.Unlock()
-	if !ok {
+	if !ok || ir.cellID != cellID {
 		return fmt.Errorf("no pending request id %d", id)
 	}
 	ir.spliceCh <- sd
@@ -683,6 +809,48 @@ func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 	return params, true
 }
 
+// samePattern compares route shapes rather than parameter names: /users/:id
+// and /users/:userID are the same public route and cannot be independently
+// owned.
+func samePattern(a, b []pathPart) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].literal != b[i].literal || (a[i].param != "") != (b[i].param != "") || a[i].catch != b[i].catch {
+			return false
+		}
+	}
+	return true
+}
+
+// patternsOverlap reports whether two route patterns can match the same
+// request path. Registration rejects overlap, not merely identical strings,
+// because first-match dispatch would otherwise turn route ownership into load
+// order. A catch-all consumes any remaining segments, including none.
+func patternsOverlap(a, b []pathPart) bool {
+	for i := 0; ; i++ {
+		if i == len(a) || i == len(b) {
+			if i == len(a) && i == len(b) {
+				return true
+			}
+			if i < len(a) && a[i].catch {
+				return true
+			}
+			if i < len(b) && b[i].catch {
+				return true
+			}
+			return false
+		}
+		if a[i].catch || b[i].catch {
+			return true
+		}
+		if a[i].literal != "" && b[i].literal != "" && a[i].literal != b[i].literal {
+			return false
+		}
+	}
+}
+
 // =====================================================================
 // Fetcher (outbound HTTP)
 // =====================================================================
@@ -695,8 +863,8 @@ func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 // goroutine doing reads is the cell's step goroutine: each http_fetch_read
 // call performs a single, bounded io.ReadFull-style read on resp.Body.
 type fetchStream struct {
-	resp    *http.Response
-	cancel  context.CancelFunc
+	resp   *http.Response
+	cancel context.CancelFunc
 	// scratch is a per-stream reusable read buffer so we don't allocate
 	// a fresh slice on every chunk. Sized to the largest read requested.
 	scratch []byte
@@ -809,6 +977,46 @@ func newFetcher(logger *slog.Logger) *fetcher {
 		guard:   guard,
 		logger:  logger,
 		streams: map[uint64]*fetchStream{},
+	}
+}
+
+// fetcherForCell returns a client and stream table owned by one application
+// cell. Sharing a package binary must not let one cell read, close, or splice
+// another cell's outbound response stream. The transport configuration is
+// intentionally the same; permissions are enforced by the host capability
+// gate before this binding is exposed.
+func fetcherForCell(cellID string) *fetcher {
+	fetchersMu.Lock()
+	defer fetchersMu.Unlock()
+	if f := cellFetchers[cellID]; f != nil {
+		return f
+	}
+	logger := slog.Default()
+	if httpFetcher != nil && httpFetcher.logger != nil {
+		logger = httpFetcher.logger
+	}
+	f := newFetcher(logger)
+	cellFetchers[cellID] = f
+	return f
+}
+
+func dropFetcherForCell(cellID string) {
+	fetchersMu.Lock()
+	f := cellFetchers[cellID]
+	delete(cellFetchers, cellID)
+	fetchersMu.Unlock()
+	if f != nil {
+		f.closeAllStreams()
+	}
+}
+
+func closeAllCellFetchers() {
+	fetchersMu.Lock()
+	fetchers := cellFetchers
+	cellFetchers = map[string]*fetcher{}
+	fetchersMu.Unlock()
+	for _, f := range fetchers {
+		f.closeAllStreams()
 	}
 }
 
@@ -1092,54 +1300,75 @@ type wsConn struct {
 type wsServer struct {
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	// routes maps path → owning cellID so TeardownCell can scrub
-	// only that cell's routes without touching other cells sharing
-	// the listener.
-	routes map[string]string
+	mu sync.Mutex
+	// Routes are scoped to both the listener and the host-issued target cell.
+	// The same package may therefore expose /health from two independently
+	// bound applications, while duplicate routes on one listener are rejected.
+	routes []wsRoute
 	conns  map[uint64]*wsConn
 	nextID atomic.Uint64
 
-	events chan []byte
+	events chan wsEvent
+}
+
+type wsRoute struct {
+	listener string
+	pattern  string
+	parts    []pathPart
+	cellID   string
+}
+
+type wsEvent struct {
+	cellID  string
+	payload []byte
 }
 
 func newWSServer(logger *slog.Logger) *wsServer {
 	return &wsServer{
 		logger: logger,
-		routes: map[string]string{},
 		conns:  map[uint64]*wsConn{},
-		events: make(chan []byte, 256),
+		events: make(chan wsEvent, 256),
 	}
 }
 
-func (w *wsServer) registerRoute(cellID, path string) error {
+func (w *wsServer) registerRoute(cellID, listener, path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("ws path %q must begin with /", path)
 	}
+	parts := parsePattern(path)
 	w.mu.Lock()
-	w.routes[path] = cellID
-	w.mu.Unlock()
-	w.logger.Info("ws route registered", "cell", cellID, "path", path)
+	defer w.mu.Unlock()
+	for _, existing := range w.routes {
+		if existing.listener != listener || !patternsOverlap(existing.parts, parts) {
+			continue
+		}
+		if existing.cellID == cellID && samePattern(existing.parts, parts) {
+			return nil
+		}
+		return fmt.Errorf("ambiguous ws route %q conflicts with route owned by %q", path, existing.cellID)
+	}
+	w.routes = append(w.routes, wsRoute{listener: listener, pattern: path, parts: parts, cellID: cellID})
+	w.logger.Info("ws route registered", "cell", cellID, "listener", listener, "path", path)
 	return nil
 }
 
-func (w *wsServer) hasRoute(path string) bool {
-	_, ok := w.ownerOfPath(path)
+func (w *wsServer) hasRoute(listener, path string) bool {
+	_, ok := w.ownerOfPath(listener, path)
 	return ok
 }
 
 // ownerOfPath returns the cellID that registered a route matching path, if any.
 // Keys are PATTERNS (supporting :param and *catchall, e.g. the remote-machine
 // relay /api/m/:id/*sub), so an exact hit is tried first, then pattern match.
-func (w *wsServer) ownerOfPath(path string) (string, bool) {
+func (w *wsServer) ownerOfPath(listener, path string) (string, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if cellID, ok := w.routes[path]; ok {
-		return cellID, true
-	}
-	for pat, cellID := range w.routes {
-		if _, ok := matchPattern(parsePattern(pat), path); ok {
-			return cellID, true
+	for _, route := range w.routes {
+		if route.listener != listener {
+			continue
+		}
+		if _, ok := matchPattern(route.parts, path); ok {
+			return route.cellID, true
 		}
 	}
 	return "", false
@@ -1150,12 +1379,15 @@ func (w *wsServer) ownerOfPath(path string) (string, bool) {
 // intact. Safe to call with a cellID that owns nothing.
 func (w *wsServer) dropCell(cellID string) (routes, conns int) {
 	w.mu.Lock()
-	for path, owner := range w.routes {
-		if owner == cellID {
-			delete(w.routes, path)
+	kept := w.routes[:0]
+	for _, route := range w.routes {
+		if route.cellID == cellID {
 			routes++
+			continue
 		}
+		kept = append(kept, route)
 	}
+	w.routes = kept
 	victims := make([]*wsConn, 0)
 	for id, c := range w.conns {
 		if c.cellID == cellID {
@@ -1172,8 +1404,8 @@ func (w *wsServer) dropCell(cellID string) (routes, conns int) {
 	return routes, conns
 }
 
-func (w *wsServer) upgrade(rw http.ResponseWriter, r *http.Request) {
-	cellID, _ := w.ownerOfPath(r.URL.Path)
+func (w *wsServer) upgrade(listener string, rw http.ResponseWriter, r *http.Request) {
+	cellID, _ := w.ownerOfPath(listener, r.URL.Path)
 	conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: false,
 	})
@@ -1210,18 +1442,21 @@ func (w *wsServer) upgrade(rw http.ResponseWriter, r *http.Request) {
 		Headers: headers,
 	})
 	if err == nil {
-		w.enqueueEvent(abi.EventWSOpen, openPayload)
+		w.enqueueEvent(cellID, abi.EventWSOpen, openPayload)
 	}
 
 	go w.readLoop(ctx, c)
 }
 
-func (w *wsServer) send(ctx context.Context, req abi.WSSendRequest) error {
+func (w *wsServer) send(cellID string, ctx context.Context, req abi.WSSendRequest) error {
 	w.mu.Lock()
 	c, ok := w.conns[req.ConnID]
 	w.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("no such conn id %d", req.ConnID)
+	}
+	if c.cellID != cellID {
+		return fmt.Errorf("conn id %d is owned by another cell", req.ConnID)
 	}
 	var mt websocket.MessageType
 	switch req.OpCode {
@@ -1235,14 +1470,14 @@ func (w *wsServer) send(ctx context.Context, req abi.WSSendRequest) error {
 	return c.conn.Write(ctx, mt, req.Payload)
 }
 
-func (w *wsServer) close(req abi.WSCloseRequest) error {
+func (w *wsServer) close(cellID string, req abi.WSCloseRequest) error {
 	w.mu.Lock()
 	c, ok := w.conns[req.ConnID]
-	if ok {
+	if ok && c.cellID == cellID {
 		delete(w.conns, req.ConnID)
 	}
 	w.mu.Unlock()
-	if !ok {
+	if !ok || c.cellID != cellID {
 		return fmt.Errorf("no such conn id %d", req.ConnID)
 	}
 	code := websocket.StatusNormalClosure
@@ -1254,12 +1489,12 @@ func (w *wsServer) close(req abi.WSCloseRequest) error {
 	return err
 }
 
-func (w *wsServer) popEvent() ([]byte, bool) {
+func (w *wsServer) popEvent() (wsEvent, bool) {
 	select {
-	case data := <-w.events:
-		return data, true
+	case event := <-w.events:
+		return event, true
 	default:
-		return nil, false
+		return wsEvent{}, false
 	}
 }
 
@@ -1303,7 +1538,7 @@ func (w *wsServer) readLoop(ctx context.Context, c *wsConn) {
 				Reason: reason,
 			})
 			if encErr == nil {
-				w.enqueueEvent(abi.EventWSClose, closePayload)
+				w.enqueueEvent(c.cellID, abi.EventWSClose, closePayload)
 			}
 			return
 		}
@@ -1325,18 +1560,18 @@ func (w *wsServer) readLoop(ctx context.Context, c *wsConn) {
 		if err != nil {
 			continue
 		}
-		w.enqueueEvent(abi.EventWSFrame, framePayload)
+		w.enqueueEvent(c.cellID, abi.EventWSFrame, framePayload)
 	}
 }
 
-func (w *wsServer) enqueueEvent(kind string, payload []byte) {
+func (w *wsServer) enqueueEvent(cellID, kind string, payload []byte) {
 	ev, err := abi.EncodeStepEvent(kind, payload)
 	if err != nil {
 		w.logger.Error("encode step event", "kind", kind, "err", err)
 		return
 	}
 	select {
-	case w.events <- ev:
+	case w.events <- wsEvent{cellID: cellID, payload: ev}:
 	default:
 		w.logger.Warn("ws event queue full — dropping event", "kind", kind)
 	}
@@ -1349,6 +1584,7 @@ func (w *wsServer) enqueueEvent(kind string, payload []byte) {
 type sseSub struct {
 	id      uint64
 	path    string
+	cellID  string
 	write   chan []byte
 	done    chan struct{}
 	flusher http.Flusher
@@ -1356,10 +1592,11 @@ type sseSub struct {
 }
 
 type sseRoute struct {
-	pattern string     // original, for logs
-	parts   []pathPart // parsed; nil for static routes
-	static  bool       // true = exact-match; false = has :param segments
-	cellID  string     // owning cell — used by dropCell for per-cell teardown
+	listener string
+	pattern  string     // original, for logs
+	parts    []pathPart // parsed; nil for static routes
+	static   bool       // true = exact-match; false = has :param segments
+	cellID   string     // owning cell — used by dropCell for per-cell teardown
 }
 
 type sseServer struct {
@@ -1383,7 +1620,7 @@ func newSSEServer(logger *slog.Logger) *sseServer {
 // match any concrete path of the same shape; cells emit events using
 // the concrete path and only clients subscribed to that exact path
 // receive them.
-func (s *sseServer) registerRoute(cellID, path string) error {
+func (s *sseServer) registerRoute(cellID, listener, path string) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("sse path %q must begin with /", path)
 	}
@@ -1396,9 +1633,18 @@ func (s *sseServer) registerRoute(cellID, path string) error {
 		}
 	}
 	s.mu.Lock()
-	s.routes = append(s.routes, sseRoute{pattern: path, parts: parts, static: isStatic, cellID: cellID})
-	s.mu.Unlock()
-	s.logger.Info("sse route registered", "cell", cellID, "pattern", path, "static", isStatic)
+	defer s.mu.Unlock()
+	for _, existing := range s.routes {
+		if existing.listener != listener || !patternsOverlap(existing.parts, parts) {
+			continue
+		}
+		if existing.cellID == cellID && samePattern(existing.parts, parts) {
+			return nil
+		}
+		return fmt.Errorf("ambiguous sse route %q conflicts with route owned by %q", path, existing.cellID)
+	}
+	s.routes = append(s.routes, sseRoute{listener: listener, pattern: path, parts: parts, static: isStatic, cellID: cellID})
+	s.logger.Info("sse route registered", "cell", cellID, "listener", listener, "pattern", path, "static", isStatic)
 	return nil
 }
 
@@ -1426,10 +1672,13 @@ func (s *sseServer) dropCell(cellID string) (routes int) {
 // hasRoute reports whether concretePath is covered by any registered
 // route. Static routes require an exact match; pattern routes require
 // the path shape to match with all :param segments filled in.
-func (s *sseServer) hasRoute(concretePath string) bool {
+func (s *sseServer) hasRoute(listener, concretePath string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, rt := range s.routes {
+		if rt.listener != listener {
+			continue
+		}
 		if rt.static {
 			if rt.pattern == concretePath {
 				return true
@@ -1443,7 +1692,7 @@ func (s *sseServer) hasRoute(concretePath string) bool {
 	return false
 }
 
-func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
+func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1456,10 +1705,15 @@ func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	cellID, ok := s.ownerOfPath(listener, r.URL.Path)
+	if !ok {
+		return
+	}
 	id := s.nextID.Add(1)
 	sub := &sseSub{
 		id:      id,
 		path:    r.URL.Path,
+		cellID:  cellID,
 		write:   make(chan []byte, 32),
 		done:    make(chan struct{}),
 		flusher: flusher,
@@ -1507,10 +1761,16 @@ func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
 // concretePath. Used by cells to decide whether to do expensive
 // per-connection work (e.g., extend a DB TTL) only when someone is
 // actually listening.
-func (s *sseServer) hasSubscribers(concretePath string) uint32 {
+func (s *sseServer) hasSubscribers(cellID, concretePath string) uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return uint32(len(s.subs[concretePath]))
+	count := uint32(0)
+	for _, sub := range s.subs[concretePath] {
+		if sub.cellID == cellID {
+			count++
+		}
+	}
+	return count
 }
 
 // emit sends a frame to every client currently subscribed to req.Path.
@@ -1519,10 +1779,13 @@ func (s *sseServer) hasSubscribers(concretePath string) uint32 {
 // incoming connections. Unknown paths (no registered route matches, or
 // no current subscribers) return nil; broadcasting into the void is not
 // an error.
-func (s *sseServer) emit(req abi.SSEEmitRequest) error {
+func (s *sseServer) emit(cellID string, req abi.SSEEmitRequest) error {
 	s.mu.Lock()
 	matchedRoute := false
 	for _, rt := range s.routes {
+		if rt.cellID != cellID {
+			continue
+		}
 		if rt.static {
 			if rt.pattern == req.Path {
 				matchedRoute = true
@@ -1541,6 +1804,9 @@ func (s *sseServer) emit(req abi.SSEEmitRequest) error {
 	}
 	targets := make([]*sseSub, 0, len(s.subs[req.Path]))
 	for _, sub := range s.subs[req.Path] {
+		if sub.cellID != cellID {
+			continue
+		}
 		targets = append(targets, sub)
 	}
 	s.mu.Unlock()
@@ -1554,6 +1820,25 @@ func (s *sseServer) emit(req abi.SSEEmitRequest) error {
 		}
 	}
 	return nil
+}
+
+func (s *sseServer) ownerOfPath(listener, concretePath string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, rt := range s.routes {
+		if rt.listener != listener {
+			continue
+		}
+		if rt.static && rt.pattern == concretePath {
+			return rt.cellID, true
+		}
+		if !rt.static {
+			if _, ok := matchPattern(rt.parts, concretePath); ok {
+				return rt.cellID, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (s *sseServer) stop() {
@@ -1588,20 +1873,39 @@ func formatSSEFrame(req abi.SSEEmitRequest) []byte {
 // =====================================================================
 
 func httpInboundSetup(env ext.SetupEnv) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if httpFetcher == nil {
+		httpFetcher = newFetcher(logger)
+	}
+	if ws == nil {
+		ws = newWSServer(logger)
+	}
+	if sse == nil {
+		sse = newSSEServer(logger)
+	}
+
+	// A host endpoint reporter selects multi-application mode. Listeners are
+	// allocated lazily per scoped app at first route registration so a guest's
+	// explicit http_listen call can still choose its private address.
+	if env.Endpoints != nil {
+		scopedHTTPMu.Lock()
+		endpointReporter = env.Endpoints
+		endpointLogger = logger
+		scopedHTTPMu.Unlock()
+		return nil
+	}
+
 	port := os.Getenv("HTTP_PORT")
 	if port == "" {
 		port = "8080"
 	}
 	addr := ":" + port
-	logger := env.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
 	server = newHTTPServer(addr, logger)
-	httpFetcher = newFetcher(logger)
-	ws = newWSServer(logger)
-	sse = newSSEServer(logger)
 
 	server.attachWebSocket(ws)
 	server.attachSSE(sse)
@@ -1618,6 +1922,19 @@ func httpInboundSetup(env ext.SetupEnv) error {
 }
 
 func httpInboundTeardown(ctx context.Context) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	scopedHTTPMu.Lock()
+	scoped := scopedServers
+	scopedServers = map[applicationInstanceKey]*scopedHTTPServer{}
+	cellApplications = map[string]applicationInstanceKey{}
+	endpointReporter = nil
+	endpointLogger = nil
+	scopedHTTPMu.Unlock()
+	for _, owned := range scoped {
+		owned.reporter.Gone(owned.endpoint)
+	}
+
 	if ws != nil {
 		ws.stop()
 	}
@@ -1627,20 +1944,77 @@ func httpInboundTeardown(ctx context.Context) error {
 	if httpFetcher != nil {
 		httpFetcher.closeAllStreams()
 	}
+	closeAllCellFetchers()
 	var firstErr error
 	for _, s := range allServers() {
 		if err := s.stop(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	for _, owned := range scoped {
+		if err := owned.server.stop(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	server = nil
+	httpFetcher = nil
+	ws = nil
+	sse = nil
+	altServersMu.Lock()
+	altServers = map[string]*httpServer{}
+	altServersMu.Unlock()
+	cellAddrMu.Lock()
+	cellAddr = map[string]string{}
+	routeBound = map[string]bool{}
+	cellAddrMu.Unlock()
 	return firstErr
+}
+
+// httpInboundTeardownScope releases exactly one hosted application instance.
+// The host-wide reporter, sibling listeners, fetchers, routes, and live
+// requests remain available to every other application in the same process.
+func httpInboundTeardownScope(ctx context.Context, scope ext.Scope) error {
+	key := applicationKey(scope)
+	scopedHTTPMu.Lock()
+	owned := scopedServers[key]
+	delete(scopedServers, key)
+	cellIDs := make([]string, 0)
+	for cellID, cellKey := range cellApplications {
+		if cellKey == key {
+			cellIDs = append(cellIDs, cellID)
+			delete(cellApplications, cellID)
+		}
+	}
+	scopedHTTPMu.Unlock()
+
+	for _, cellID := range cellIDs {
+		for _, current := range allServers() {
+			current.dropCellState(cellID)
+		}
+		if ws != nil {
+			ws.dropCell(cellID)
+		}
+		if sse != nil {
+			sse.dropCell(cellID)
+		}
+		cellAddrMu.Lock()
+		delete(cellAddr, cellID)
+		delete(routeBound, cellID)
+		cellAddrMu.Unlock()
+		dropFetcherForCell(cellID)
+	}
+	if owned == nil {
+		return nil
+	}
+	owned.reporter.Gone(owned.endpoint)
+	return owned.server.stop(ctx)
 }
 
 // httpInboundTeardownCell drops only the named cell's routes and
 // inflight requests across every HTTP server. Other cells' routes
 // and requests keep running. Safe to call with a cell name that
 // owns no routes.
-func httpInboundTeardownCell(_ context.Context, cellID string) error {
+func httpInboundTeardownCell(ctx context.Context, cellID string) error {
 	totalRoutes, totalPending := 0, 0
 	for _, s := range allServers() {
 		r, p := s.dropCellState(cellID)
@@ -1651,7 +2025,32 @@ func httpInboundTeardownCell(_ context.Context, cellID string) error {
 	// wouldn't inherit a stale addr binding.
 	cellAddrMu.Lock()
 	delete(cellAddr, cellID)
+	delete(routeBound, cellID)
 	cellAddrMu.Unlock()
+	dropFetcherForCell(cellID)
+	var retired *scopedHTTPServer
+	scopedHTTPMu.Lock()
+	if key, ok := cellApplications[cellID]; ok {
+		delete(cellApplications, cellID)
+		stillOwned := false
+		for _, otherKey := range cellApplications {
+			if otherKey == key {
+				stillOwned = true
+				break
+			}
+		}
+		if !stillOwned {
+			retired = scopedServers[key]
+			delete(scopedServers, key)
+		}
+	}
+	scopedHTTPMu.Unlock()
+	if retired != nil {
+		retired.reporter.Gone(retired.endpoint)
+		if err := retired.server.stop(ctx); err != nil {
+			return err
+		}
+	}
 	if totalRoutes > 0 || totalPending > 0 {
 		slog.Default().Info("http teardown cell",
 			"cell", cellID,
@@ -1672,20 +2071,20 @@ func httpInboundPoll() (ext.StepEvent, bool) {
 				return ext.StepEvent{}, false
 			}
 			return ext.StepEvent{
-				Kind:     "http.request",
-				Payload:  payload,
-				ID:       ir.req.ID,
-				CellID: ir.cellID,
+				Kind:    "http.request",
+				Payload: payload,
+				ID:      ir.req.ID,
+				CellID:  ir.cellID,
 			}, true
 		}
 	}
 
 	// Then check WebSocket events.
 	if ws != nil {
-		if data, ok := ws.popEvent(); ok {
+		if event, ok := ws.popEvent(); ok {
 			// data is already an encoded StepEvent (kind+payload). Decode
 			// to extract kind and payload so they fit ext.StepEvent.
-			ev, err := abi.DecodeStepEvent(data)
+			ev, err := abi.DecodeStepEvent(event.payload)
 			if err != nil {
 				ws.logger.Error("decode ws step event", "err", err)
 				return ext.StepEvent{}, false
@@ -1693,6 +2092,7 @@ func httpInboundPoll() (ext.StepEvent, bool) {
 			return ext.StepEvent{
 				Kind:    ev.Kind,
 				Payload: ev.Payload,
+				CellID:  event.cellID,
 			}, true
 		}
 	}
@@ -1711,7 +2111,8 @@ func httpInboundFinalize(id uint64) {
 // =====================================================================
 
 func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	scope := ext.ScopeOf(cell)
 
 	// http_listen(addr) — cell declares its preferred listen address
 	// before registering any routes. Multiple cells may call with the
@@ -1736,15 +2137,35 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if reg.Addr == "" {
 				return 4
 			}
+			cellAddrMu.RLock()
+			existingAddr, hasBinding := cellAddr[cellID]
+			alreadyRouted := routeBound[cellID]
+			cellAddrMu.RUnlock()
+			if alreadyRouted || (hasBinding && existingAddr != reg.Addr) {
+				// A listener is part of the application composition. Letting a
+				// cell switch it after routes exist makes its host binding
+				// ambiguous, so it must be declared before registration.
+				return 6
+			}
 			logger := slog.Default()
 			if server != nil && server.logger != nil {
 				logger = server.logger
 			}
-			if _, err := ensureAltServer(reg.Addr, logger); err != nil {
-				logger.Error("http_listen bind failed", "cell", cellID, "addr", reg.Addr, "err", err)
-				return 5
+			if !scope.IsLegacy() && scopedEndpointMode() {
+				if resolveScopedServer(scope, cellID, reg.Addr) == nil {
+					return 5
+				}
+			} else {
+				if _, err := ensureAltServer(reg.Addr, logger); err != nil {
+					logger.Error("http_listen bind failed", "cell", cellID, "addr", reg.Addr, "err", err)
+					return 5
+				}
 			}
 			cellAddrMu.Lock()
+			if routeBound[cellID] || (cellAddr[cellID] != "" && cellAddr[cellID] != reg.Addr) {
+				cellAddrMu.Unlock()
+				return 6
+			}
 			cellAddr[cellID] = reg.Addr
 			cellAddrMu.Unlock()
 			logger.Info("http_listen", "cell", cellID, "addr", reg.Addr)
@@ -1768,13 +2189,16 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err := msgpack.Unmarshal(data, &reg); err != nil {
 				return 3
 			}
-			srv := resolveServerForCell(cellID)
+			srv := resolveServerForCell(cellID, scope)
 			if srv == nil {
 				return 5
 			}
 			if err := srv.registerRoute(cellID, reg.Method, reg.Path); err != nil {
 				return 4
 			}
+			cellAddrMu.Lock()
+			routeBound[cellID] = true
+			cellAddrMu.Unlock()
 			return 0
 		}).
 		Export("http_register")
@@ -1796,7 +2220,7 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			// alt server. Try each until one accepts the response.
 			delivered := false
 			for _, s := range allServers() {
-				if err := s.respond(resp); err == nil {
+				if err := s.respond(cellID, resp); err == nil {
 					delivered = true
 					break
 				}
@@ -1827,7 +2251,7 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			fs, ok := httpFetcher.takeStream(meta.StreamID)
+			fs, ok := fetcherForCell(cellID).takeStream(meta.StreamID)
 			if !ok {
 				return 4
 			}
@@ -1840,7 +2264,7 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			}
 			// Deliver to whichever server holds the pending request.
 			for _, srv := range allServers() {
-				if err := srv.respondStream(meta.ID, sd); err == nil {
+				if err := srv.respondStream(cellID, meta.ID, sd); err == nil {
 					return 0
 				}
 			}
@@ -1872,7 +2296,8 @@ func httpInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // Capability bindings: transport.http.outbound
 // =====================================================================
 
-func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
+func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellFetcher := fetcherForCell(ext.CellIDOf(cell))
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 			if reqLen == 0 {
@@ -1887,10 +2312,10 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 				return 3
 			}
 
-			if httpFetcher == nil {
+			if cellFetcher == nil {
 				return 99
 			}
-			resp, err := httpFetcher.do(ctx, req)
+			resp, err := cellFetcher.do(ctx, req)
 			if err != nil {
 				return 4
 			}
@@ -1954,10 +2379,10 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			if httpFetcher == nil {
+			if cellFetcher == nil {
 				return 99
 			}
-			id, status, headers, err := httpFetcher.begin(ctx, req)
+			id, status, headers, err := cellFetcher.begin(ctx, req)
 			if err != nil {
 				return 4
 			}
@@ -1967,22 +2392,22 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 				Headers: headers,
 			})
 			if err != nil {
-				_ = httpFetcher.closeStream(id)
+				_ = cellFetcher.closeStream(id)
 				return 5
 			}
 			allocFn := m.ExportedFunction("pulp_alloc")
 			if allocFn == nil {
-				_ = httpFetcher.closeStream(id)
+				_ = cellFetcher.closeStream(id)
 				return 6
 			}
 			results, err := allocFn.Call(ctx, uint64(len(hdrBytes)))
 			if err != nil || len(results) == 0 {
-				_ = httpFetcher.closeStream(id)
+				_ = cellFetcher.closeStream(id)
 				return 7
 			}
 			ptr := uint32(results[0])
 			if ptr == 0 {
-				_ = httpFetcher.closeStream(id)
+				_ = cellFetcher.closeStream(id)
 				return 7
 			}
 			if !m.Memory().Write(ptr, hdrBytes) {
@@ -2022,10 +2447,10 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 			if maxBytes == 0 {
 				return 1
 			}
-			if httpFetcher == nil {
+			if cellFetcher == nil {
 				return 99
 			}
-			data, eof, err := httpFetcher.readChunk(id, maxBytes)
+			data, eof, err := cellFetcher.readChunk(id, maxBytes)
 			chunk := abi.HTTPFetchChunk{Bytes: data, EOF: eof}
 			if err != nil {
 				chunk.Err = err.Error()
@@ -2066,10 +2491,10 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, streamIDLo, streamIDHi uint32) uint32 {
 			id := (uint64(streamIDHi) << 32) | uint64(streamIDLo)
-			if httpFetcher == nil {
+			if cellFetcher == nil {
 				return 99
 			}
-			_ = httpFetcher.closeStream(id)
+			_ = cellFetcher.closeStream(id)
 			return 0
 		}).
 		Export("http_fetch_close")
@@ -2098,7 +2523,8 @@ func httpOutboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // =====================================================================
 
 func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	scope := ext.ScopeOf(cell)
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 			if pathLen == 0 {
@@ -2111,9 +2537,16 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if ws == nil {
 				return 99
 			}
-			if err := ws.registerRoute(cellID, string(data)); err != nil {
+			srv := resolveServerForCell(cellID, scope)
+			if srv == nil {
+				return 99
+			}
+			if err := ws.registerRoute(cellID, srv.listenerKey(), string(data)); err != nil {
 				return 4
 			}
+			cellAddrMu.Lock()
+			routeBound[cellID] = true
+			cellAddrMu.Unlock()
 			return 0
 		}).
 		Export("ws_register")
@@ -2134,7 +2567,7 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if ws == nil {
 				return 99
 			}
-			if err := ws.send(ctx, req); err != nil {
+			if err := ws.send(cellID, ctx, req); err != nil {
 				return 4
 			}
 			return 0
@@ -2157,7 +2590,7 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if ws == nil {
 				return 99
 			}
-			if err := ws.close(req); err != nil {
+			if err := ws.close(cellID, req); err != nil {
 				return 4
 			}
 			return 0
@@ -2185,7 +2618,8 @@ func wsInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // =====================================================================
 
 func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	scope := ext.ScopeOf(cell)
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 			if pathLen == 0 {
@@ -2198,9 +2632,16 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if sse == nil {
 				return 99
 			}
-			if err := sse.registerRoute(cellID, string(data)); err != nil {
+			srv := resolveServerForCell(cellID, scope)
+			if srv == nil {
+				return 99
+			}
+			if err := sse.registerRoute(cellID, srv.listenerKey(), string(data)); err != nil {
 				return 4
 			}
+			cellAddrMu.Lock()
+			routeBound[cellID] = true
+			cellAddrMu.Unlock()
 			return 0
 		}).
 		Export("sse_register")
@@ -2221,7 +2662,7 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if sse == nil {
 				return 99
 			}
-			if err := sse.emit(req); err != nil {
+			if err := sse.emit(cellID, req); err != nil {
 				return 4
 			}
 			return 0
@@ -2244,7 +2685,7 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if sse == nil {
 				return 99
 			}
-			count := sse.hasSubscribers(string(data))
+			count := sse.hasSubscribers(cellID, string(data))
 			if !m.Memory().WriteUint32Le(outCountPtr, count) {
 				return 8
 			}
