@@ -277,6 +277,7 @@ func allServers() []*httpServer {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "transport.http.inbound",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-http",
 		Register:      httpInboundRegister,
 		Stub:          httpInboundStub,
 		Setup:         httpInboundSetup,
@@ -289,12 +290,14 @@ func init() {
 
 	ext.Register(ext.Capability{
 		Name:     "transport.http.outbound",
+		Provider: "github.com/BananaLabs-OSS/Pulp-ext-http",
 		Register: httpOutboundRegister,
 		Stub:     httpOutboundStub,
 	})
 
 	ext.Register(ext.Capability{
 		Name:         "transport.ws.inbound",
+		Provider:     "github.com/BananaLabs-OSS/Pulp-ext-http",
 		Register:     wsInboundRegister,
 		Stub:         wsInboundStub,
 		TeardownCell: wsInboundTeardownCell,
@@ -302,6 +305,7 @@ func init() {
 
 	ext.Register(ext.Capability{
 		Name:         "transport.sse",
+		Provider:     "github.com/BananaLabs-OSS/Pulp-ext-http",
 		Register:     sseRegister,
 		Stub:         sseStub,
 		TeardownCell: sseTeardownCell,
@@ -451,6 +455,12 @@ func (s *httpServer) registerRoute(cellID, method, pattern string) error {
 		if existing.cellID == cellID && samePattern(existing.parts, parts) {
 			// Re-registering an identical route by its owner is idempotent.
 			return nil
+		}
+		if existing.cellID == cellID {
+			// One cell may expose conventional static and parameterized
+			// siblings such as /presence/count and /presence/:userID.
+			// Dispatch resolves those overlaps by pattern specificity below.
+			continue
 		}
 		return fmt.Errorf("ambiguous %s route %q conflicts with route owned by %q", method, pattern, existing.cellID)
 	}
@@ -605,20 +615,7 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 	copy(snapshot, s.routes)
 	s.mu.Unlock()
 
-	var match *route
-	var params map[string]string
-	for i := range snapshot {
-		if snapshot[i].method != r.Method {
-			continue
-		}
-		p, ok := matchPattern(snapshot[i].parts, r.URL.Path)
-		if !ok {
-			continue
-		}
-		match = &snapshot[i]
-		params = p
-		break
-	}
+	match, params := selectRoute(snapshot, r.Method, r.URL.Path)
 	if match == nil {
 		// Match native Gin's default NoRoute shape — bare "text/plain"
 		// with "404 page not found" body. http.NotFound would add a
@@ -826,6 +823,62 @@ func matchPattern(parts []pathPart, path string) (map[string]string, bool) {
 		return nil, false
 	}
 	return params, true
+}
+
+// selectRoute chooses the most specific matching route instead of allowing
+// registration order to decide between static, parameterized, and catch-all
+// routes owned by the same cell.
+func selectRoute(routes []route, method, path string) (*route, map[string]string) {
+	var match *route
+	var params map[string]string
+	for i := range routes {
+		if routes[i].method != method {
+			continue
+		}
+		candidateParams, ok := matchPattern(routes[i].parts, path)
+		if !ok {
+			continue
+		}
+		if match != nil && !moreSpecificPattern(routes[i].parts, match.parts) {
+			continue
+		}
+		match = &routes[i]
+		params = candidateParams
+	}
+	return match, params
+}
+
+// moreSpecificPattern compares route shapes from left to right. A literal is
+// more specific than a parameter, a parameter is more specific than a
+// catch-all, and an exact end is more specific than a catch-all that can match
+// an empty suffix.
+func moreSpecificPattern(candidate, current []pathPart) bool {
+	limit := len(candidate)
+	if len(current) > limit {
+		limit = len(current)
+	}
+	for i := 0; i <= limit; i++ {
+		candidateRank := patternPartSpecificity(candidate, i)
+		currentRank := patternPartSpecificity(current, i)
+		if candidateRank != currentRank {
+			return candidateRank > currentRank
+		}
+	}
+	return false
+}
+
+func patternPartSpecificity(parts []pathPart, index int) int {
+	if index >= len(parts) {
+		return 3
+	}
+	switch {
+	case parts[index].literal != "":
+		return 2
+	case !parts[index].catch:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // samePattern compares route shapes rather than parameter names: /users/:id
