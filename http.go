@@ -1972,7 +1972,13 @@ func httpInboundSetup(env ext.SetupEnv) error {
 		return nil
 	}
 
-	port := os.Getenv("HTTP_PORT")
+	// Direct Pulp applications supply their selected port through SetupEnv so
+	// independent in-process runtimes never race by mutating HTTP_PORT. The
+	// environment remains the backwards-compatible fallback for legacy hosts.
+	port := strings.TrimSpace(env.HTTPPort)
+	if port == "" {
+		port = os.Getenv("HTTP_PORT")
+	}
 	if port == "" {
 		port = "8080"
 	}
