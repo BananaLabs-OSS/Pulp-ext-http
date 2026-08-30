@@ -605,7 +605,7 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.ws.upgrade(s.listenerKey(), w, r)
 		return
 	}
-	if s.sse != nil && r.Method == http.MethodGet && s.sse.hasRoute(s.listenerKey(), r.URL.Path) {
+	if s.sse != nil && r.Method == http.MethodGet && requestAcceptsEventStream(r) && s.sse.hasRoute(s.listenerKey(), r.URL.Path) {
 		s.sse.handle(s.listenerKey(), w, r)
 		return
 	}
@@ -711,6 +711,21 @@ func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		http.Error(w, "cell timeout", http.StatusGatewayTimeout)
 	}
+}
+
+func requestAcceptsEventStream(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	for _, value := range request.Header.Values("Accept") {
+		for _, item := range strings.Split(value, ",") {
+			mediaType := strings.TrimSpace(strings.SplitN(item, ";", 2)[0])
+			if strings.EqualFold(mediaType, "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // streamSplice writes a streaming response: it sends the directive's status +
