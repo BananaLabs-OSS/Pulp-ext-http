@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,8 +54,14 @@ const (
 	// Matches the legacy-fetch outbound cap so the host OOM profile is
 	// symmetric. Cells needing larger inbound payloads should use streaming
 	// multipart or chunked paths and avoid holding the whole body in memory.
-	maxInboundBodyBytes int64 = 50 * 1024 * 1024 // 50 MiB
+	maxInboundBodyBytes    int64 = 50 * 1024 * 1024 // 50 MiB
+	sseMaxHeaderBytes            = 16 << 10
+	sseMaxHeaderValueBytes       = 8 << 10
+	sseMaxReplayBytes            = 256 << 10
+	sseMaxTotalClients           = 4096
 )
+
+var sseAuthorizeTimeout = 2 * time.Second
 
 // ---------------------------------------------------------------------
 // Module-level shared state
@@ -1669,21 +1677,28 @@ func (w *wsServer) enqueueEvent(cellID, kind string, payload []byte) {
 // =====================================================================
 
 type sseSub struct {
-	id      uint64
-	path    string
-	cellID  string
-	write   chan []byte
-	done    chan struct{}
-	flusher http.Flusher
-	writer  http.ResponseWriter
+	id       uint64
+	path     string
+	cellID   string
+	write    chan []byte
+	done     chan struct{}
+	cancel   chan struct{}
+	once     sync.Once
+	binding  string
+	topic    string
+	audience string
+	flusher  http.Flusher
+	writer   http.ResponseWriter
 }
 
 type sseRoute struct {
-	listener string
-	pattern  string     // original, for logs
-	parts    []pathPart // parsed; nil for static routes
-	static   bool       // true = exact-match; false = has :param segments
-	cellID   string     // owning cell — used by dropCell for per-cell teardown
+	listener  string
+	pattern   string     // original, for logs
+	parts     []pathPart // parsed; nil for static routes
+	static    bool       // true = exact-match; false = has :param segments
+	cellID    string     // owning cell — used by dropCell for per-cell teardown
+	v2        *abi.SSERegisterRequestV2
+	authorize func(context.Context, string, []byte) ([]byte, error)
 }
 
 type sseServer struct {
@@ -1694,6 +1709,12 @@ type sseServer struct {
 	subs   map[string]map[uint64]*sseSub
 	nextID atomic.Uint64
 }
+
+type sseProviderCell interface {
+	Call(context.Context, string, []byte) ([]byte, error)
+}
+
+var sseBindingRE = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 
 func newSSEServer(logger *slog.Logger) *sseServer {
 	return &sseServer{
@@ -1708,6 +1729,17 @@ func newSSEServer(logger *slog.Logger) *sseServer {
 // the concrete path and only clients subscribed to that exact path
 // receive them.
 func (s *sseServer) registerRoute(cellID, listener, path string) error {
+	return s.register(cellID, listener, path, nil, nil)
+}
+
+func (s *sseServer) registerRouteV2(cellID, listener string, request abi.SSERegisterRequestV2, caller sseProviderCell) error {
+	if request.Version != "pulp.sse.v2" || caller == nil || (request.Audience != abi.SSEAudiencePublic && request.Audience != abi.SSEAudienceAccount && request.Audience != abi.SSEAudiencePool) || request.MaxClients < 1 || request.MaxClients > 1024 || request.QueueDepth < 1 || request.QueueDepth > 64 || request.ReplayLimit > 256 {
+		return errors.New("invalid subscriber-aware SSE route")
+	}
+	return s.register(cellID, listener, request.Pattern, &request, caller.Call)
+}
+
+func (s *sseServer) register(cellID, listener, path string, v2 *abi.SSERegisterRequestV2, authorize func(context.Context, string, []byte) ([]byte, error)) error {
 	if !strings.HasPrefix(path, "/") {
 		return fmt.Errorf("sse path %q must begin with /", path)
 	}
@@ -1730,7 +1762,7 @@ func (s *sseServer) registerRoute(cellID, listener, path string) error {
 		}
 		return fmt.Errorf("ambiguous sse route %q conflicts with route owned by %q", path, existing.cellID)
 	}
-	s.routes = append(s.routes, sseRoute{listener: listener, pattern: path, parts: parts, static: isStatic, cellID: cellID})
+	s.routes = append(s.routes, sseRoute{listener: listener, pattern: path, parts: parts, static: isStatic, cellID: cellID, v2: v2, authorize: authorize})
 	s.logger.Info("sse route registered", "cell", cellID, "listener", listener, "pattern", path, "static", isStatic)
 	return nil
 }
@@ -1752,6 +1784,17 @@ func (s *sseServer) dropCell(cellID string) (routes int) {
 		kept = append(kept, rt)
 	}
 	s.routes = kept
+	for path, subscribers := range s.subs {
+		for id, sub := range subscribers {
+			if sub.cellID == cellID {
+				sub.once.Do(func() { close(sub.cancel) })
+				delete(subscribers, id)
+			}
+		}
+		if len(subscribers) == 0 {
+			delete(s.subs, path)
+		}
+	}
 	s.mu.Unlock()
 	return routes
 }
@@ -1786,42 +1829,68 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	cellID, ok := s.ownerOfPath(listener, r.URL.Path)
+	route, ok := s.routeForPath(listener, r.URL.Path)
 	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	binding, replay, err := s.authorize(route, r)
+	if err != nil {
+		http.Error(w, "sse authorization denied", http.StatusUnauthorized)
 		return
 	}
 	id := s.nextID.Add(1)
+	queueDepth := 32
+	if route.v2 != nil {
+		queueDepth = int(route.v2.QueueDepth)
+	}
 	sub := &sseSub{
-		id:      id,
-		path:    r.URL.Path,
-		cellID:  cellID,
-		write:   make(chan []byte, 32),
-		done:    make(chan struct{}),
-		flusher: flusher,
-		writer:  w,
+		id:       id,
+		path:     r.URL.Path,
+		cellID:   route.cellID,
+		write:    make(chan []byte, queueDepth),
+		done:     make(chan struct{}),
+		cancel:   make(chan struct{}),
+		binding:  binding.Binding,
+		topic:    binding.Topic,
+		audience: binding.Audience,
+		flusher:  flusher,
+		writer:   w,
 	}
 
 	s.mu.Lock()
+	if route.v2 != nil && (s.totalSubscribersLocked() >= sseMaxTotalClients || len(s.subs[sub.path]) >= int(route.v2.MaxClients)) {
+		s.mu.Unlock()
+		return
+	}
 	if _, ok := s.subs[sub.path]; !ok {
 		s.subs[sub.path] = map[uint64]*sseSub{}
 	}
 	s.subs[sub.path][id] = sub
 	s.mu.Unlock()
-
 	defer func() {
 		s.mu.Lock()
 		if m, ok := s.subs[sub.path]; ok {
 			delete(m, id)
+			if len(m) == 0 {
+				delete(s.subs, sub.path)
+			}
 		}
 		s.mu.Unlock()
 		close(sub.done)
 	}()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+	for _, event := range replay {
+		if _, err = w.Write(formatSSEFrame(abi.SSEEmitRequest{ID: event.ID, Event: event.Event, Data: event.Data})); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
 
 	ticker := time.NewTicker(sseKeepalive)
 	defer ticker.Stop()
@@ -1829,6 +1898,8 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-sub.cancel:
 			return
 		case <-ticker.C:
 			if _, err := w.Write([]byte(":ping\n\n")); err != nil {
@@ -1909,7 +1980,37 @@ func (s *sseServer) emit(cellID string, req abi.SSEEmitRequest) error {
 	return nil
 }
 
+func (s *sseServer) emitV2(cellID string, req abi.SSEEmitRequestV2) error {
+	if req.Version != "pulp.sse.v2" || (req.Audience != abi.SSEAudiencePublic && req.Audience != abi.SSEAudienceAccount && req.Audience != abi.SSEAudiencePool) || !sseBindingRE.MatchString(req.Binding) || len(req.Topic) > 128 || len(req.ID) > 128 || len(req.Event) > 128 || len(req.Data) > 64<<10 {
+		return errors.New("invalid subscriber-aware SSE event")
+	}
+	s.mu.Lock()
+	var targets []*sseSub
+	for _, subscribers := range s.subs {
+		for _, sub := range subscribers {
+			if sub.cellID == cellID && sub.audience == req.Audience && sub.binding == req.Binding && sub.topic == req.Topic {
+				targets = append(targets, sub)
+			}
+		}
+	}
+	s.mu.Unlock()
+	payload := formatSSEFrame(abi.SSEEmitRequest{ID: req.ID, Event: req.Event, Data: req.Data})
+	for _, sub := range targets {
+		select {
+		case sub.write <- payload:
+		default:
+			sub.once.Do(func() { close(sub.cancel) })
+		}
+	}
+	return nil
+}
+
 func (s *sseServer) ownerOfPath(listener, concretePath string) (string, bool) {
+	route, ok := s.routeForPath(listener, concretePath)
+	return route.cellID, ok
+}
+
+func (s *sseServer) routeForPath(listener, concretePath string) (sseRoute, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, rt := range s.routes {
@@ -1917,19 +2018,86 @@ func (s *sseServer) ownerOfPath(listener, concretePath string) (string, bool) {
 			continue
 		}
 		if rt.static && rt.pattern == concretePath {
-			return rt.cellID, true
+			return rt, true
 		}
 		if !rt.static {
 			if _, ok := matchPattern(rt.parts, concretePath); ok {
-				return rt.cellID, true
+				return rt, true
 			}
 		}
 	}
-	return "", false
+	return sseRoute{}, false
+}
+
+func (s *sseServer) totalSubscribersLocked() int {
+	total := 0
+	for _, subscribers := range s.subs {
+		total += len(subscribers)
+	}
+	return total
+}
+
+func (s *sseServer) authorize(route sseRoute, request *http.Request) (abi.SSEAuthResultV2, []abi.SSEReplayEventV2, error) {
+	if route.v2 == nil {
+		return abi.SSEAuthResultV2{Version: "pulp.sse.v1", Audience: abi.SSEAudiencePublic, Binding: "legacy-public-global"}, nil, nil
+	}
+	authorization, cookie, lastID := request.Header.Get("Authorization"), request.Header.Get("Cookie"), request.Header.Get("Last-Event-ID")
+	if len(authorization) > sseMaxHeaderValueBytes || len(cookie) > sseMaxHeaderValueBytes || len(lastID) > 256 || len(authorization)+len(cookie)+len(lastID) > sseMaxHeaderBytes || len(request.URL.RawQuery) > 4096 {
+		return abi.SSEAuthResultV2{}, nil, errors.New("SSE auth context exceeds bounds")
+	}
+	wire, err := abi.EncodeSSEAuthRequestV2(abi.SSEAuthRequestV2{Version: "pulp.sse.auth.v2", Audience: route.v2.Audience, Method: request.Method, Path: request.URL.Path, Query: request.URL.RawQuery, Authorization: authorization, Cookie: cookie, LastEventID: lastID})
+	if err != nil {
+		return abi.SSEAuthResultV2{}, nil, err
+	}
+	requestedCursor := uint64(0)
+	if lastID != "" {
+		requestedCursor, err = strconv.ParseUint(lastID, 10, 64)
+		if err != nil {
+			return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE replay cursor")
+		}
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), sseAuthorizeTimeout)
+	defer cancel()
+	resultWire, err := route.authorize(ctx, abi.SSEAuthProviderV2, wire)
+	if err != nil {
+		return abi.SSEAuthResultV2{}, nil, errors.New("SSE authorization provider denied request")
+	}
+	result, err := abi.DecodeSSEAuthResultV2(resultWire)
+	if err != nil || result.Version != "pulp.sse.binding.v2" || result.Audience != route.v2.Audience || !sseBindingRE.MatchString(result.Binding) || result.ExpiresAtUnixMilli <= uint64(time.Now().UnixMilli()) || result.ExpiresAtUnixMilli > uint64(time.Now().Add(24*time.Hour).UnixMilli()) || uint32(len(result.Replay)) > route.v2.ReplayLimit {
+		return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE authorization binding")
+	}
+	if (result.Audience == abi.SSEAudiencePublic && (result.Binding != "public_global_v2" || result.Topic != "")) || (result.Audience == abi.SSEAudienceAccount && result.Topic != "") || (result.Audience == abi.SSEAudiencePool && !sseBindingRE.MatchString(result.Topic)) {
+		return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE audience binding")
+	}
+	total := 0
+	lastCursor := requestedCursor
+	for _, event := range result.Replay {
+		if len(event.ID) > 128 || len(event.Event) > 128 || len(event.Data) > 64<<10 {
+			return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE replay item")
+		}
+		eventCursor, parseErr := strconv.ParseUint(event.ID, 10, 64)
+		if parseErr != nil || eventCursor <= lastCursor || eventCursor > result.Cursor {
+			return abi.SSEAuthResultV2{}, nil, errors.New("SSE replay cursor regressed")
+		}
+		lastCursor = eventCursor
+		total += len(event.ID) + len(event.Event) + len(event.Data)
+		if total > sseMaxReplayBytes {
+			return abi.SSEAuthResultV2{}, nil, errors.New("SSE replay exceeds bound")
+		}
+	}
+	if result.Cursor < lastCursor || result.Cursor < requestedCursor {
+		return abi.SSEAuthResultV2{}, nil, errors.New("SSE replay cursor regressed")
+	}
+	return result, result.Replay, nil
 }
 
 func (s *sseServer) stop() {
 	s.mu.Lock()
+	for _, subscribers := range s.subs {
+		for _, sub := range subscribers {
+			sub.once.Do(func() { close(sub.cancel) })
+		}
+	}
 	s.subs = map[string]map[uint64]*sseSub{}
 	s.mu.Unlock()
 }
@@ -1997,7 +2165,11 @@ func httpInboundSetup(env ext.SetupEnv) error {
 	if port == "" {
 		port = "8080"
 	}
+	host := strings.TrimSpace(os.Getenv("HTTP_HOST"))
 	addr := ":" + port
+	if host != "" {
+		addr = net.JoinHostPort(host, port)
+	}
 	server = newHTTPServer(addr, logger)
 
 	server.attachWebSocket(ws)
@@ -2748,6 +2920,34 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
+			request, err := abi.DecodeSSERegisterRequestV2(data)
+			caller, callerOK := cell.(sseProviderCell)
+			if err != nil || !callerOK || sse == nil {
+				return 3
+			}
+			srv := resolveServerForCell(cellID, scope)
+			if srv == nil {
+				return 99
+			}
+			if err = sse.registerRouteV2(cellID, srv.listenerKey(), request, caller); err != nil {
+				return 4
+			}
+			cellAddrMu.Lock()
+			routeBound[cellID] = true
+			cellAddrMu.Unlock()
+			return 0
+		}).
+		Export("sse_register_v2")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
 			req, err := abi.DecodeSSEEmitRequest(data)
 			if err != nil {
 				return 3
@@ -2761,6 +2961,26 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			return 0
 		}).
 		Export("sse_emit")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			request, err := abi.DecodeSSEEmitRequestV2(data)
+			if err != nil || sse == nil {
+				return 3
+			}
+			if err = sse.emitV2(cellID, request); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("sse_emit_v2")
 
 	// sse_has_subscribers(path_ptr, path_len, out_count_ptr) — cell
 	// passes the concrete path; host writes the number of currently
@@ -2795,7 +3015,13 @@ func sseStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 		Export("sse_register")
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("sse_register_v2")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
 		Export("sse_emit")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("sse_emit_v2")
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, _, _, _ uint32) uint32 { return 99 }).
 		Export("sse_has_subscribers")
