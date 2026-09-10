@@ -1733,7 +1733,7 @@ func (s *sseServer) registerRoute(cellID, listener, path string) error {
 }
 
 func (s *sseServer) registerRouteV2(cellID, listener string, request abi.SSERegisterRequestV2, caller sseProviderCell) error {
-	if request.Version != "pulp.sse.v2" || caller == nil || (request.Audience != abi.SSEAudiencePublic && request.Audience != abi.SSEAudienceAccount && request.Audience != abi.SSEAudiencePool) || request.MaxClients < 1 || request.MaxClients > 1024 || request.QueueDepth < 1 || request.QueueDepth > 64 || request.ReplayLimit > 256 {
+	if request.Version != abi.SSETransportVersionV2 || caller == nil || (request.Audience != abi.SSEAudiencePublic && request.Audience != abi.SSEAudienceAccount && request.Audience != abi.SSEAudiencePool) || request.MaxClients < 1 || request.MaxClients > 1024 || request.QueueDepth < 1 || request.QueueDepth > 64 || request.ReplayLimit > 256 {
 		return errors.New("invalid subscriber-aware SSE route")
 	}
 	return s.register(cellID, listener, request.Pattern, &request, caller.Call)
@@ -1839,6 +1839,14 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 		http.Error(w, "sse authorization denied", http.StatusUnauthorized)
 		return
 	}
+	var expiry <-chan time.Time
+	var expiryTimer *time.Timer
+	if binding.ExpiresAtUnixMilli != 0 {
+		expiresAt := time.UnixMilli(int64(binding.ExpiresAtUnixMilli))
+		expiryTimer = time.NewTimer(time.Until(expiresAt))
+		expiry = expiryTimer.C
+		defer expiryTimer.Stop()
+	}
 	id := s.nextID.Add(1)
 	queueDepth := 32
 	if route.v2 != nil {
@@ -1886,6 +1894,11 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	for _, event := range replay {
+		select {
+		case <-expiry:
+			return
+		default:
+		}
 		if _, err = w.Write(formatSSEFrame(abi.SSEEmitRequest{ID: event.ID, Event: event.Event, Data: event.Data})); err != nil {
 			return
 		}
@@ -1900,6 +1913,8 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 		case <-r.Context().Done():
 			return
 		case <-sub.cancel:
+			return
+		case <-expiry:
 			return
 		case <-ticker.C:
 			if _, err := w.Write([]byte(":ping\n\n")); err != nil {
@@ -1981,7 +1996,7 @@ func (s *sseServer) emit(cellID string, req abi.SSEEmitRequest) error {
 }
 
 func (s *sseServer) emitV2(cellID string, req abi.SSEEmitRequestV2) error {
-	if req.Version != "pulp.sse.v2" || (req.Audience != abi.SSEAudiencePublic && req.Audience != abi.SSEAudienceAccount && req.Audience != abi.SSEAudiencePool) || !sseBindingRE.MatchString(req.Binding) || len(req.Topic) > 128 || len(req.ID) > 128 || len(req.Event) > 128 || len(req.Data) > 64<<10 {
+	if req.Version != abi.SSETransportVersionV2 || (req.Audience != abi.SSEAudiencePublic && req.Audience != abi.SSEAudienceAccount && req.Audience != abi.SSEAudiencePool) || !sseBindingRE.MatchString(req.Binding) || len(req.Topic) > 128 || len(req.ID) > 128 || len(req.Event) > 128 || len(req.Data) > 64<<10 {
 		return errors.New("invalid subscriber-aware SSE event")
 	}
 	s.mu.Lock()
@@ -2045,7 +2060,7 @@ func (s *sseServer) authorize(route sseRoute, request *http.Request) (abi.SSEAut
 	if len(authorization) > sseMaxHeaderValueBytes || len(cookie) > sseMaxHeaderValueBytes || len(lastID) > 256 || len(authorization)+len(cookie)+len(lastID) > sseMaxHeaderBytes || len(request.URL.RawQuery) > 4096 {
 		return abi.SSEAuthResultV2{}, nil, errors.New("SSE auth context exceeds bounds")
 	}
-	wire, err := abi.EncodeSSEAuthRequestV2(abi.SSEAuthRequestV2{Version: "pulp.sse.auth.v2", Audience: route.v2.Audience, Method: request.Method, Path: request.URL.Path, Query: request.URL.RawQuery, Authorization: authorization, Cookie: cookie, LastEventID: lastID})
+	wire, err := abi.EncodeSSEAuthRequestV2(abi.SSEAuthRequestV2{Version: abi.SSEAuthRequestVersionV2, Audience: route.v2.Audience, Method: request.Method, Path: request.URL.Path, Query: request.URL.RawQuery, Authorization: authorization, Cookie: cookie, LastEventID: lastID})
 	if err != nil {
 		return abi.SSEAuthResultV2{}, nil, err
 	}
@@ -2063,7 +2078,7 @@ func (s *sseServer) authorize(route sseRoute, request *http.Request) (abi.SSEAut
 		return abi.SSEAuthResultV2{}, nil, errors.New("SSE authorization provider denied request")
 	}
 	result, err := abi.DecodeSSEAuthResultV2(resultWire)
-	if err != nil || result.Version != "pulp.sse.binding.v2" || result.Audience != route.v2.Audience || !sseBindingRE.MatchString(result.Binding) || result.ExpiresAtUnixMilli <= uint64(time.Now().UnixMilli()) || result.ExpiresAtUnixMilli > uint64(time.Now().Add(24*time.Hour).UnixMilli()) || uint32(len(result.Replay)) > route.v2.ReplayLimit {
+	if err != nil || result.Version != abi.SSEBindingVersionV2 || result.Audience != route.v2.Audience || !sseBindingRE.MatchString(result.Binding) || result.ExpiresAtUnixMilli <= uint64(time.Now().UnixMilli()) || result.ExpiresAtUnixMilli > uint64(time.Now().Add(24*time.Hour).UnixMilli()) || uint32(len(result.Replay)) > route.v2.ReplayLimit {
 		return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE authorization binding")
 	}
 	if (result.Audience == abi.SSEAudiencePublic && (result.Binding != "public_global_v2" || result.Topic != "")) || (result.Audience == abi.SSEAudienceAccount && result.Topic != "") || (result.Audience == abi.SSEAudiencePool && !sseBindingRE.MatchString(result.Topic)) {
