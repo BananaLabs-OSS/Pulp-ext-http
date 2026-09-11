@@ -278,7 +278,10 @@ func asPositiveInt64(value any) (int64, bool) {
 	case int32:
 		return int64(value), value > 0
 	case uint64:
-		return int64(value), value > 0 && value <= uint64(^uint64(0)>>1)
+		if value == 0 || value > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(value), true
 	default:
 		return 0, false
 	}
@@ -409,8 +412,17 @@ func (r *httpProbeRuntime) observe(parent context.Context, intent httpProbeInten
 	}
 	digest := sha256.Sum256(body)
 	receipt.Transport = "observed"
+	if response.StatusCode < 0 || uint64(response.StatusCode) > uint64(^uint16(0)) {
+		receipt.Transport = "invalid_status"
+		return receipt
+	}
+	bodyBytes, ok := wasmLength(len(body))
+	if !ok {
+		receipt.Transport = "body_too_large"
+		return receipt
+	}
 	receipt.HTTPStatus = uint16(response.StatusCode)
-	receipt.BodyBytes = uint32(len(body))
+	receipt.BodyBytes = bodyBytes
 	receipt.BodySHA256 = hex.EncodeToString(digest[:])
 	return receipt
 }
@@ -421,11 +433,12 @@ func writeHTTPProbeResponse(ctx context.Context, module api.Module, payload []by
 		return 6
 	}
 	result, err := alloc.Call(ctx, uint64(len(payload)))
-	if err != nil || len(result) == 0 || uint32(result[0]) == 0 {
+	ptr, pointerOK := wasmPointer(result)
+	if err != nil || !pointerOK {
 		return 6
 	}
-	ptr := uint32(result[0])
-	if !module.Memory().Write(ptr, payload) || !module.Memory().WriteUint32Le(ptrOut, ptr) || !module.Memory().WriteUint32Le(lenOut, uint32(len(payload))) {
+	payloadLen, lengthOK := wasmLength(len(payload))
+	if !lengthOK || !module.Memory().Write(ptr, payload) || !module.Memory().WriteUint32Le(ptrOut, ptr) || !module.Memory().WriteUint32Le(lenOut, payloadLen) {
 		return 6
 	}
 	return 0

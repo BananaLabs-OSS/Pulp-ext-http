@@ -11,6 +11,13 @@
 //	HTTP_PORT  — listen port (default 8080)
 //	HTTP_CERT  — path to TLS certificate PEM (optional)
 //	HTTP_KEY   — path to TLS private key PEM (optional)
+//	PULP_HTTP_AUTH — "pairing", "bananaauth", or application-owned route auth
+//	PULP_HTTP_PAIRING_TOKEN — owner browser-pairing secret, at least 32 characters
+//	PULP_HTTP_SESSION_KEY_FILE — optional persistent session-signing key path
+//	PULP_HTTP_IDENTITY_URL — exact private BananaAuth /auth/session resolver URL
+//	PULP_HTTP_ORIGIN — exact public HTTPS origin
+//	PULP_HTTP_TRUST_PROXY — exact loopback or private TLS-proxy IP; a private
+//	                        proxy requires an explicit private-IP listener
 package httpext
 
 import (
@@ -62,6 +69,20 @@ const (
 )
 
 var sseAuthorizeTimeout = 2 * time.Second
+
+func wasmPointer(results []uint64) (uint32, bool) {
+	if len(results) == 0 || results[0] == 0 || results[0] > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(results[0]), true // #nosec G115 -- upper bound checked above
+}
+
+func wasmLength(length int) (uint32, bool) {
+	if length < 0 || uint64(length) > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(length), true
+}
 
 // ---------------------------------------------------------------------
 // Module-level shared state
@@ -249,6 +270,7 @@ func ensureAltServer(addr string, logger *slog.Logger) (*httpServer, error) {
 		return s, nil
 	}
 	s = newHTTPServer(addr, logger)
+	s.publicEdge = true
 	s.attachWebSocket(ws)
 	s.attachSSE(sse)
 	if err := s.start(context.Background()); err != nil {
@@ -409,8 +431,10 @@ type httpServer struct {
 	ws    *wsServer
 	sse   *sseServer
 
-	certPath string
-	keyPath  string
+	certPath   string
+	keyPath    string
+	auth       *edgeAuth
+	publicEdge bool
 }
 
 func newHTTPServer(addr string, logger *slog.Logger) *httpServer {
@@ -509,12 +533,20 @@ func (s *httpServer) dropCellState(cellID string) (routesDropped, pendingDropped
 }
 
 func (s *httpServer) start(_ context.Context) error {
+	if s.publicEdge {
+		auth, err := newEdgeAuthFromEnv(s.addr, s.certPath != "" && s.keyPath != "")
+		if err != nil {
+			return err
+		}
+		s.auth = auth
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.dispatch)
 
 	s.srv = &http.Server{
-		Addr:    s.addr,
-		Handler: mux,
+		Addr:              s.addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	useTLS := s.certPath != "" && s.keyPath != ""
 
@@ -602,6 +634,21 @@ func (s *httpServer) finalize(id uint64) {
 }
 
 func (s *httpServer) dispatch(w http.ResponseWriter, r *http.Request) {
+	if s.auth != nil {
+		if s.auth.handlePair(w, r) {
+			return
+		}
+		principal, ok := s.auth.authorize(w, r)
+		if !ok {
+			return
+		}
+		// Identity is asserted only by the native edge. A browser can never
+		// choose the principal seen by a cell.
+		r.Header.Del("X-Pulp-Principal")
+		r.Header.Set("X-Pulp-Principal", principal)
+	} else {
+		r.Header.Del("X-Pulp-Principal")
+	}
 	// Only hand a request to the WS handler if it's an ACTUAL WebSocket upgrade.
 	// A path can carry both a WS route and HTTP routes (e.g. the machine relay
 	// /api/m/:id/*sub: WS for terminals, HTTP for the proxy); a plain GET/POST
@@ -1186,6 +1233,10 @@ func (f *fetcher) begin(ctx context.Context, req abi.HTTPFetchRequest) (id uint6
 	f.streamMu.Lock()
 	f.streams[id] = &fetchStream{resp: resp, cancel: cancel}
 	f.streamMu.Unlock()
+	if resp.StatusCode < 0 || uint64(resp.StatusCode) > uint64(^uint32(0)) {
+		_ = f.closeStream(id)
+		return 0, 0, nil, errors.New("invalid HTTP status code")
+	}
 	return id, uint32(resp.StatusCode), hdrs, nil
 }
 
@@ -1374,6 +1425,9 @@ func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPRes
 		}
 	}
 
+	if resp.StatusCode < 0 || uint64(resp.StatusCode) > uint64(^uint32(0)) {
+		return abi.HTTPResponse{}, errors.New("invalid HTTP status code")
+	}
 	return abi.HTTPResponse{
 		Status:  uint32(resp.StatusCode),
 		Headers: headers,
@@ -1622,7 +1676,11 @@ func (w *wsServer) readLoop(ctx context.Context, c *wsConn) {
 	for {
 		msgType, data, err := c.conn.Read(ctx)
 		if err != nil {
-			code := uint16(websocket.CloseStatus(err))
+			status := websocket.CloseStatus(err)
+			code := uint16(1006)
+			if status >= 0 && uint64(status) <= uint64(^uint16(0)) {
+				code = uint16(status)
+			}
 			reason := err.Error()
 			if errors.Is(err, context.Canceled) {
 				reason = "host canceled"
@@ -1842,7 +1900,8 @@ func (s *sseServer) handle(listener string, w http.ResponseWriter, r *http.Reque
 	var expiry <-chan time.Time
 	var expiryTimer *time.Timer
 	if binding.ExpiresAtUnixMilli != 0 {
-		expiresAt := time.UnixMilli(int64(binding.ExpiresAtUnixMilli))
+		// authorize rejects values beyond now+24h, which is inside int64.
+		expiresAt := time.UnixMilli(int64(binding.ExpiresAtUnixMilli)) // #nosec G115 -- bounded by authorize
 		expiryTimer = time.NewTimer(time.Until(expiresAt))
 		expiry = expiryTimer.C
 		defer expiryTimer.Stop()
@@ -2078,7 +2137,7 @@ func (s *sseServer) authorize(route sseRoute, request *http.Request) (abi.SSEAut
 		return abi.SSEAuthResultV2{}, nil, errors.New("SSE authorization provider denied request")
 	}
 	result, err := abi.DecodeSSEAuthResultV2(resultWire)
-	if err != nil || result.Version != abi.SSEBindingVersionV2 || result.Audience != route.v2.Audience || !sseBindingRE.MatchString(result.Binding) || result.ExpiresAtUnixMilli <= uint64(time.Now().UnixMilli()) || result.ExpiresAtUnixMilli > uint64(time.Now().Add(24*time.Hour).UnixMilli()) || uint32(len(result.Replay)) > route.v2.ReplayLimit {
+	if err != nil || result.Version != abi.SSEBindingVersionV2 || result.Audience != route.v2.Audience || !sseBindingRE.MatchString(result.Binding) || result.ExpiresAtUnixMilli <= uint64(time.Now().UnixMilli()) || result.ExpiresAtUnixMilli > uint64(time.Now().Add(24*time.Hour).UnixMilli()) || uint64(len(result.Replay)) > uint64(route.v2.ReplayLimit) {
 		return abi.SSEAuthResultV2{}, nil, errors.New("invalid SSE authorization binding")
 	}
 	if (result.Audience == abi.SSEAudiencePublic && (result.Binding != "public_global_v2" || result.Topic != "")) || (result.Audience == abi.SSEAudienceAccount && result.Topic != "") || (result.Audience == abi.SSEAudiencePool && !sseBindingRE.MatchString(result.Topic)) {
@@ -2186,6 +2245,7 @@ func httpInboundSetup(env ext.SetupEnv) error {
 		addr = net.JoinHostPort(host, port)
 	}
 	server = newHTTPServer(addr, logger)
+	server.publicEdge = true
 
 	server.attachWebSocket(ws)
 	server.attachSSE(sse)
@@ -2613,9 +2673,13 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil || len(results) == 0 {
 				return 7
 			}
-			respPtr := uint32(results[0])
-			if respPtr == 0 {
+			respPtr, pointerOK := wasmPointer(results)
+			if !pointerOK {
 				return 7
+			}
+			respLen, lengthOK := wasmLength(len(respBytes))
+			if !lengthOK {
+				return 8
 			}
 
 			if !m.Memory().Write(respPtr, respBytes) {
@@ -2624,7 +2688,7 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !m.Memory().WriteUint32Le(respPtrOut, respPtr) {
 				return 8
 			}
-			if !m.Memory().WriteUint32Le(respLenOut, uint32(len(respBytes))) {
+			if !m.Memory().WriteUint32Le(respLenOut, respLen) {
 				return 8
 			}
 			return 0
@@ -2685,10 +2749,15 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 				_ = cellFetcher.closeStream(id)
 				return 7
 			}
-			ptr := uint32(results[0])
-			if ptr == 0 {
+			ptr, pointerOK := wasmPointer(results)
+			if !pointerOK {
 				_ = cellFetcher.closeStream(id)
 				return 7
+			}
+			hdrLen, lengthOK := wasmLength(len(hdrBytes))
+			if !lengthOK {
+				_ = cellFetcher.closeStream(id)
+				return 8
 			}
 			if !m.Memory().Write(ptr, hdrBytes) {
 				_ = httpFetcher.closeStream(id)
@@ -2698,7 +2767,7 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 				_ = httpFetcher.closeStream(id)
 				return 8
 			}
-			if !m.Memory().WriteUint32Le(hdrLenOut, uint32(len(hdrBytes))) {
+			if !m.Memory().WriteUint32Le(hdrLenOut, hdrLen) {
 				_ = httpFetcher.closeStream(id)
 				return 8
 			}
@@ -2747,9 +2816,13 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if allocErr != nil || len(results) == 0 {
 				return 7
 			}
-			ptr := uint32(results[0])
-			if ptr == 0 {
+			ptr, pointerOK := wasmPointer(results)
+			if !pointerOK {
 				return 7
+			}
+			chunkLen, lengthOK := wasmLength(len(payload))
+			if !lengthOK {
+				return 8
 			}
 			if !m.Memory().Write(ptr, payload) {
 				return 8
@@ -2757,7 +2830,7 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !m.Memory().WriteUint32Le(chunkPtrOut, ptr) {
 				return 8
 			}
-			if !m.Memory().WriteUint32Le(chunkLenOut, uint32(len(payload))) {
+			if !m.Memory().WriteUint32Le(chunkLenOut, chunkLen) {
 				return 8
 			}
 			return 0

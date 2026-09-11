@@ -253,11 +253,12 @@ func writeMinecraftProfileResponse(ctx context.Context, module api.Module, paylo
 		return 6
 	}
 	result, err := alloc.Call(ctx, uint64(len(payload)))
-	if err != nil || len(result) == 0 || uint32(result[0]) == 0 {
+	ptr, pointerOK := wasmPointer(result)
+	if err != nil || !pointerOK {
 		return 6
 	}
-	ptr := uint32(result[0])
-	if !module.Memory().Write(ptr, payload) || !module.Memory().WriteUint32Le(ptrOut, ptr) || !module.Memory().WriteUint32Le(lenOut, uint32(len(payload))) {
+	payloadLen, lengthOK := wasmLength(len(payload))
+	if !lengthOK || !module.Memory().Write(ptr, payload) || !module.Memory().WriteUint32Le(ptrOut, ptr) || !module.Memory().WriteUint32Le(lenOut, payloadLen) {
 		return 6
 	}
 	return 0

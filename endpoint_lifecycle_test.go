@@ -199,6 +199,7 @@ func TestLegacySetupStillUsesHTTPPortDefaultListener(t *testing.T) {
 	}
 	_ = listener.Close()
 	t.Setenv("HTTP_PORT", port)
+	t.Setenv("HTTP_HOST", "127.0.0.1")
 	if err := httpInboundSetup(ext.SetupEnv{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}); err != nil {
 		t.Fatalf("legacy setup: %v", err)
 	}
@@ -225,6 +226,7 @@ func TestScopedRegistrationFallsBackToDefaultListenerForTypedNilEndpointRegistry
 	}
 	_ = listener.Close()
 	t.Setenv("HTTP_PORT", port)
+	t.Setenv("HTTP_HOST", "127.0.0.1")
 
 	// Direct Pulp applications use an optional concrete endpoint registry.
 	// Passing its nil default through ext.EndpointReporter produces a typed-nil
